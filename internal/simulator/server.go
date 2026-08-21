@@ -16,7 +16,9 @@ var (
 // ServerConfig makes heterogeneous GameServer pools easy to reproduce.
 type ServerConfig struct {
 	ID               string
+	Address          string
 	Region           string
+	Zone             string
 	Version          string
 	Capacity         int
 	BaseCPUPercent   float64
@@ -64,7 +66,9 @@ func (s *GameServer) Snapshot() model.GameServerSnapshot {
 	defer s.mu.RUnlock()
 	return model.GameServerSnapshot{
 		ID:             s.cfg.ID,
+		Address:        s.cfg.Address,
 		Region:         s.cfg.Region,
+		Zone:           s.cfg.Zone,
 		Version:        s.cfg.Version,
 		State:          s.state,
 		Capacity:       s.cfg.Capacity,

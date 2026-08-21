@@ -2,37 +2,75 @@
 
 GameMesh 是一个面向多人在线游戏的自适应流量与 GameServer 调度层。
 
-当前版本：**M0 / Baseline**。
+当前版本：**M1 / Registry & Failure Detection**。
 
-## M0 已实现
+## M1 已实现
 
-- 核心领域模型；
-- GameServer Simulator；
-- 异构 GameServer Cluster；
-- Scheduler 插件接口；
-- RoundRobin 基准调度器；
-- 并发 Benchmark Framework；
-- 基础单元测试。
+在 M0 的领域模型、Simulator、RoundRobin 和 Benchmark 基础上新增：
+
+- GameServer Registry；
+- GameServer 地址 / Zone 服务发现字段；
+- Heartbeat Lease；
+- TTL Failure Detection；
+- `UNHEALTHY` 自动隔离与心跳恢复；
+- Graceful Deregister；
+- 原子发布的只读 Registry View；
+- Heartbeat O(1) 更新 + 周期批量快照发布；
+- 节点状态变化立即发布；
+- Registry → Scheduler 集成测试；
+- 并发 / Race Test；
+- Registry 微基准。
+
+## 核心链路
+
+```text
+GameServer / Simulator
+        │
+        │ Register + Heartbeat
+        ▼
+┌─────────────────────────┐
+│ GameServer Registry     │
+│                         │
+│ Lease / TTL             │
+│ Failure Detection       │
+│ Membership              │
+│ Metrics                 │
+└───────────┬─────────────┘
+            │ batched publish
+            ▼
+     Immutable View
+            │ O(1) read
+            ▼
+        Scheduler
+            │
+            ▼
+       GameServer
+```
+
+普通指标心跳只更新 Registry Entry 并标记 dirty；`PublishInterval` 到期后批量生成一个新 View。`READY -> DRAINING`、超时成为 `UNHEALTHY`、恢复等会影响路由正确性的状态变化立即发布。
 
 ## 目录
 
 ```text
-GameMesh-M0/
+GameMesh-M1/
 ├── cmd/
-│   ├── benchmark/       # 基准实验 CLI
-│   └── simulator/       # Simulator 快速预览
+│   ├── benchmark/          # M0 基准实验
+│   ├── registry-demo/      # M1 注册/心跳/故障演示
+│   └── simulator/
 ├── internal/
 │   ├── benchmark/
+│   ├── registry/           # M1 新增
 │   ├── scheduler/
 │   └── simulator/
-├── pkg/
-│   └── model/           # 可供未来 adapter/gateway 复用的领域模型
-├── tests/               # M1+ 跨模块测试预留
-├── benchmarks/
-│   └── results/
-└── docs/
-    ├── foundation/      # v0.1 立项与可行性调研
-    └── 06_m0_implementation.md
+├── pkg/model/
+├── benchmarks/results/
+├── docs/
+│   ├── foundation/
+│   ├── 06_m0_implementation.md
+│   ├── 07_m0_baseline_report.md
+│   ├── 08_m1_implementation.md
+│   └── 09_m1_validation_report.md
+└── tests/
 ```
 
 ## 运行
@@ -41,23 +79,33 @@ GameMesh-M0/
 
 ```bash
 go test ./...
-go run ./cmd/simulator
+go vet ./...
+go test -race ./...
+```
+
+运行 M1 Failure Detection 演示：
+
+```bash
+go run ./cmd/registry-demo
+```
+
+运行原 M0 Benchmark：
+
+```bash
 go run ./cmd/benchmark -servers 100 -capacity 1000 -players 10000 -workers 8
 ```
 
-保存基准结果：
+运行 Registry 微基准：
 
 ```bash
-go run ./cmd/benchmark \
-  -servers 100 \
-  -capacity 1000 \
-  -players 100000 \
-  -workers 8 \
-  -out benchmarks/results/round-robin-100k.json
+go test ./internal/registry -run '^$' -bench . -benchmem
+go test ./internal/simulator -run '^$' -bench BenchmarkClusterSnapshots1000Servers -benchmem
 ```
 
 ## 当前边界
 
-M0 不包含真实网络 Gateway、Redis/Kafka、Kubernetes/Agones、自动扩缩容或智能 LoadScore。它的职责是提供后续所有策略可公平比较的 Baseline。
+M1 的 Registry 仍是单进程 In-Memory Control Plane，不提供跨节点一致性；这符合当前里程碑目标。后续接 Kubernetes/Agones 或 etcd 时，可以通过 Adapter 替换持久化/发现层，而不改变 Scheduler 的领域模型。
 
-下一阶段：**M1 GameServer Registry + Heartbeat + Failure Detection**。
+M1 解决了请求路径重复构造 Cluster Snapshot 的问题，但 M0 RoundRobin 仍会每次遍历全部候选并创建 `eligible` 切片。**M2 将以 Scheduler 数据结构与负载策略为核心解决这一瓶颈。**
+
+下一阶段：**M2 Load Balancer：LeastConnection / Weighted / LeastLoad / LoadScore + RoundRobin 对照实验。**

@@ -41,7 +41,9 @@ func NewHeterogeneousCluster(count, baseCapacity int) *Cluster {
 		capacityMultiplier := []float64{0.80, 1.00, 1.20, 1.40}[i%4]
 		configs = append(configs, ServerConfig{
 			ID:               fmt.Sprintf("gs-%04d", i+1),
+			Address:          fmt.Sprintf("127.0.0.1:%d", 7000+i),
 			Region:           regions[i%len(regions)],
+			Zone:             fmt.Sprintf("zone-%c", 'a'+rune(i%3)),
 			Version:          "v1",
 			Capacity:         int(float64(baseCapacity) * capacityMultiplier),
 			BaseCPUPercent:   6 + float64((i*7)%13),
