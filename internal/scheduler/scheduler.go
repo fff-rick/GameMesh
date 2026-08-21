@@ -13,5 +13,5 @@ var ErrNoCandidate = errors.New("no eligible game server")
 // Implementations must not mutate candidate snapshots.
 type Scheduler interface {
 	Name() string
-	Schedule(context.Context, model.AllocationRequest, []model.GameServerSnapshot) (model.AllocationResult, error)
+	Schedule(context.Context, model.AllocationRequest, Candidates) (model.AllocationResult, error)
 }
