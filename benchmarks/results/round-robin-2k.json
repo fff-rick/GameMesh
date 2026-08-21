@@ -1,0 +1,177 @@
+{
+  "strategy": "round_robin",
+  "players_requested": 2000,
+  "successful_allocations": 2000,
+  "failed_allocations": 0,
+  "duration_ms": 5.3740380000000005,
+  "throughput_per_second": 372159.6311749191,
+  "schedule_p50_us": 2.343,
+  "schedule_p95_us": 16.986,
+  "schedule_p99_us": 126.678,
+  "average_utilization": 0.47470238095238093,
+  "utilization_stddev": 0.10052080579640804,
+  "max_utilization": 0.625,
+  "overloaded_servers": 0,
+  "server_distribution": [
+    {
+      "id": "gs-0001",
+      "players": 100,
+      "capacity": 160,
+      "utilization": 0.625,
+      "cpu_percent": 51,
+      "tick_ms": 10.5
+    },
+    {
+      "id": "gs-0002",
+      "players": 100,
+      "capacity": 200,
+      "utilization": 0.5,
+      "cpu_percent": 49,
+      "tick_ms": 11
+    },
+    {
+      "id": "gs-0003",
+      "players": 100,
+      "capacity": 240,
+      "utilization": 0.4166666666666667,
+      "cpu_percent": 37,
+      "tick_ms": 11.666666666666666
+    },
+    {
+      "id": "gs-0004",
+      "players": 100,
+      "capacity": 280,
+      "utilization": 0.35714285714285715,
+      "cpu_percent": 39.714285714285715,
+      "tick_ms": 12.428571428571429
+    },
+    {
+      "id": "gs-0005",
+      "players": 100,
+      "capacity": 160,
+      "utilization": 0.625,
+      "cpu_percent": 53,
+      "tick_ms": 14.5
+    },
+    {
+      "id": "gs-0006",
+      "players": 100,
+      "capacity": 200,
+      "utilization": 0.5,
+      "cpu_percent": 51,
+      "tick_ms": 10
+    },
+    {
+      "id": "gs-0007",
+      "players": 100,
+      "capacity": 240,
+      "utilization": 0.4166666666666667,
+      "cpu_percent": 39,
+      "tick_ms": 10.666666666666666
+    },
+    {
+      "id": "gs-0008",
+      "players": 100,
+      "capacity": 280,
+      "utilization": 0.35714285714285715,
+      "cpu_percent": 41.714285714285715,
+      "tick_ms": 11.428571428571429
+    },
+    {
+      "id": "gs-0009",
+      "players": 100,
+      "capacity": 160,
+      "utilization": 0.625,
+      "cpu_percent": 55,
+      "tick_ms": 13.5
+    },
+    {
+      "id": "gs-0010",
+      "players": 100,
+      "capacity": 200,
+      "utilization": 0.5,
+      "cpu_percent": 53,
+      "tick_ms": 14
+    },
+    {
+      "id": "gs-0011",
+      "players": 100,
+      "capacity": 240,
+      "utilization": 0.4166666666666667,
+      "cpu_percent": 41,
+      "tick_ms": 9.666666666666666
+    },
+    {
+      "id": "gs-0012",
+      "players": 100,
+      "capacity": 280,
+      "utilization": 0.35714285714285715,
+      "cpu_percent": 43.714285714285715,
+      "tick_ms": 10.428571428571429
+    },
+    {
+      "id": "gs-0013",
+      "players": 100,
+      "capacity": 160,
+      "utilization": 0.625,
+      "cpu_percent": 57,
+      "tick_ms": 12.5
+    },
+    {
+      "id": "gs-0014",
+      "players": 100,
+      "capacity": 200,
+      "utilization": 0.5,
+      "cpu_percent": 42,
+      "tick_ms": 13
+    },
+    {
+      "id": "gs-0015",
+      "players": 100,
+      "capacity": 240,
+      "utilization": 0.4166666666666667,
+      "cpu_percent": 43,
+      "tick_ms": 13.666666666666666
+    },
+    {
+      "id": "gs-0016",
+      "players": 100,
+      "capacity": 280,
+      "utilization": 0.35714285714285715,
+      "cpu_percent": 32.714285714285715,
+      "tick_ms": 9.428571428571429
+    },
+    {
+      "id": "gs-0017",
+      "players": 100,
+      "capacity": 160,
+      "utilization": 0.625,
+      "cpu_percent": 59,
+      "tick_ms": 11.5
+    },
+    {
+      "id": "gs-0018",
+      "players": 100,
+      "capacity": 200,
+      "utilization": 0.5,
+      "cpu_percent": 44,
+      "tick_ms": 12
+    },
+    {
+      "id": "gs-0019",
+      "players": 100,
+      "capacity": 240,
+      "utilization": 0.4166666666666667,
+      "cpu_percent": 45,
+      "tick_ms": 12.666666666666666
+    },
+    {
+      "id": "gs-0020",
+      "players": 100,
+      "capacity": 280,
+      "utilization": 0.35714285714285715,
+      "cpu_percent": 34.714285714285715,
+      "tick_ms": 13.428571428571429
+    }
+  ]
+}

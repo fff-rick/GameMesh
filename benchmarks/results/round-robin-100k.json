@@ -1,0 +1,818 @@
+{
+  "strategy": "round_robin",
+  "players_requested": 100000,
+  "successful_allocations": 100000,
+  "failed_allocations": 0,
+  "allocation_retries": 1,
+  "duration_ms": 842.21673,
+  "throughput_per_second": 118734.2835139359,
+  "schedule_p50_us": 11.848,
+  "schedule_p95_us": 214.895,
+  "schedule_p99_us": 741.814,
+  "average_utilization": 0.9255928571428576,
+  "utilization_stddev": 0.08761614413538142,
+  "max_utilization": 1,
+  "overloaded_servers": 75,
+  "server_distribution": [
+    {
+      "id": "gs-0001",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 78,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0002",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 85,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0003",
+      "players": 1101,
+      "capacity": 1200,
+      "utilization": 0.9175,
+      "cpu_percent": 73.06,
+      "tick_ms": 29.381499999999996
+    },
+    {
+      "id": "gs-0004",
+      "players": 1100,
+      "capacity": 1400,
+      "utilization": 0.7857142857142857,
+      "cpu_percent": 70.57142857142857,
+      "tick_ms": 14.857142857142856
+    },
+    {
+      "id": "gs-0005",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 80,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0006",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 87,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0007",
+      "players": 1099,
+      "capacity": 1200,
+      "utilization": 0.9158333333333334,
+      "cpu_percent": 74.94,
+      "tick_ms": 28.063722222222232
+    },
+    {
+      "id": "gs-0008",
+      "players": 1098,
+      "capacity": 1400,
+      "utilization": 0.7842857142857143,
+      "cpu_percent": 72.46857142857142,
+      "tick_ms": 13.79542857142857
+    },
+    {
+      "id": "gs-0009",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 82,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0010",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 89,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0011",
+      "players": 1099,
+      "capacity": 1200,
+      "utilization": 0.9158333333333334,
+      "cpu_percent": 76.94,
+      "tick_ms": 27.063722222222232
+    },
+    {
+      "id": "gs-0012",
+      "players": 1099,
+      "capacity": 1400,
+      "utilization": 0.785,
+      "cpu_percent": 74.52000000000001,
+      "tick_ms": 12.826000000000002
+    },
+    {
+      "id": "gs-0013",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 84,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0014",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 78,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0015",
+      "players": 1099,
+      "capacity": 1200,
+      "utilization": 0.9158333333333334,
+      "cpu_percent": 78.94,
+      "tick_ms": 31.063722222222232
+    },
+    {
+      "id": "gs-0016",
+      "players": 1099,
+      "capacity": 1400,
+      "utilization": 0.785,
+      "cpu_percent": 63.52,
+      "tick_ms": 11.826000000000002
+    },
+    {
+      "id": "gs-0017",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 86,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0018",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 80,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0019",
+      "players": 1100,
+      "capacity": 1200,
+      "utilization": 0.9166666666666666,
+      "cpu_percent": 81,
+      "tick_ms": 30.222222222222214
+    },
+    {
+      "id": "gs-0020",
+      "players": 1098,
+      "capacity": 1400,
+      "utilization": 0.7842857142857143,
+      "cpu_percent": 65.46857142857142,
+      "tick_ms": 15.79542857142857
+    },
+    {
+      "id": "gs-0021",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 88,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0022",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 82,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0023",
+      "players": 1100,
+      "capacity": 1200,
+      "utilization": 0.9166666666666666,
+      "cpu_percent": 83,
+      "tick_ms": 29.222222222222214
+    },
+    {
+      "id": "gs-0024",
+      "players": 1097,
+      "capacity": 1400,
+      "utilization": 0.7835714285714286,
+      "cpu_percent": 67.41714285714286,
+      "tick_ms": 14.765428571428572
+    },
+    {
+      "id": "gs-0025",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 90,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0026",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 84,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0027",
+      "players": 1100,
+      "capacity": 1200,
+      "utilization": 0.9166666666666666,
+      "cpu_percent": 72,
+      "tick_ms": 28.222222222222214
+    },
+    {
+      "id": "gs-0028",
+      "players": 1100,
+      "capacity": 1400,
+      "utilization": 0.7857142857142857,
+      "cpu_percent": 69.57142857142857,
+      "tick_ms": 13.857142857142856
+    },
+    {
+      "id": "gs-0029",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 79,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0030",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 86,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0031",
+      "players": 1099,
+      "capacity": 1200,
+      "utilization": 0.9158333333333334,
+      "cpu_percent": 73.94,
+      "tick_ms": 27.063722222222232
+    },
+    {
+      "id": "gs-0032",
+      "players": 1100,
+      "capacity": 1400,
+      "utilization": 0.7857142857142857,
+      "cpu_percent": 71.57142857142857,
+      "tick_ms": 12.857142857142856
+    },
+    {
+      "id": "gs-0033",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 81,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0034",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 88,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0035",
+      "players": 1099,
+      "capacity": 1200,
+      "utilization": 0.9158333333333334,
+      "cpu_percent": 75.94,
+      "tick_ms": 31.063722222222232
+    },
+    {
+      "id": "gs-0036",
+      "players": 1098,
+      "capacity": 1400,
+      "utilization": 0.7842857142857143,
+      "cpu_percent": 73.46857142857142,
+      "tick_ms": 11.79542857142857
+    },
+    {
+      "id": "gs-0037",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 83,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0038",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 90,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0039",
+      "players": 1097,
+      "capacity": 1200,
+      "utilization": 0.9141666666666667,
+      "cpu_percent": 77.82000000000001,
+      "tick_ms": 29.749055555555557
+    },
+    {
+      "id": "gs-0040",
+      "players": 1099,
+      "capacity": 1400,
+      "utilization": 0.785,
+      "cpu_percent": 62.52,
+      "tick_ms": 15.826000000000002
+    },
+    {
+      "id": "gs-0041",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 85,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0042",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 79,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0043",
+      "players": 1099,
+      "capacity": 1200,
+      "utilization": 0.9158333333333334,
+      "cpu_percent": 79.94,
+      "tick_ms": 29.063722222222232
+    },
+    {
+      "id": "gs-0044",
+      "players": 1099,
+      "capacity": 1400,
+      "utilization": 0.785,
+      "cpu_percent": 64.52000000000001,
+      "tick_ms": 14.826000000000002
+    },
+    {
+      "id": "gs-0045",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 87,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0046",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 81,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0047",
+      "players": 1097,
+      "capacity": 1200,
+      "utilization": 0.9141666666666667,
+      "cpu_percent": 81.82000000000001,
+      "tick_ms": 27.749055555555557
+    },
+    {
+      "id": "gs-0048",
+      "players": 1099,
+      "capacity": 1400,
+      "utilization": 0.785,
+      "cpu_percent": 66.52000000000001,
+      "tick_ms": 13.826000000000002
+    },
+    {
+      "id": "gs-0049",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 89,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0050",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 83,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0051",
+      "players": 1100,
+      "capacity": 1200,
+      "utilization": 0.9166666666666666,
+      "cpu_percent": 84,
+      "tick_ms": 27.222222222222214
+    },
+    {
+      "id": "gs-0052",
+      "players": 1102,
+      "capacity": 1400,
+      "utilization": 0.7871428571428571,
+      "cpu_percent": 68.67428571428572,
+      "tick_ms": 12.921142857142858
+    },
+    {
+      "id": "gs-0053",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 78,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0054",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 85,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0055",
+      "players": 1102,
+      "capacity": 1200,
+      "utilization": 0.9183333333333333,
+      "cpu_percent": 73.12,
+      "tick_ms": 31.541555555555554
+    },
+    {
+      "id": "gs-0056",
+      "players": 1101,
+      "capacity": 1400,
+      "utilization": 0.7864285714285715,
+      "cpu_percent": 70.62285714285714,
+      "tick_ms": 11.888857142857145
+    },
+    {
+      "id": "gs-0057",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 80,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0058",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 87,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0059",
+      "players": 1099,
+      "capacity": 1200,
+      "utilization": 0.9158333333333334,
+      "cpu_percent": 74.94,
+      "tick_ms": 30.063722222222232
+    },
+    {
+      "id": "gs-0060",
+      "players": 1101,
+      "capacity": 1400,
+      "utilization": 0.7864285714285715,
+      "cpu_percent": 72.62285714285714,
+      "tick_ms": 15.888857142857145
+    },
+    {
+      "id": "gs-0061",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 82,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0062",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 89,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0063",
+      "players": 1100,
+      "capacity": 1200,
+      "utilization": 0.9166666666666666,
+      "cpu_percent": 77,
+      "tick_ms": 29.222222222222214
+    },
+    {
+      "id": "gs-0064",
+      "players": 1100,
+      "capacity": 1400,
+      "utilization": 0.7857142857142857,
+      "cpu_percent": 74.57142857142857,
+      "tick_ms": 14.857142857142856
+    },
+    {
+      "id": "gs-0065",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 84,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0066",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 78,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0067",
+      "players": 1099,
+      "capacity": 1200,
+      "utilization": 0.9158333333333334,
+      "cpu_percent": 78.94,
+      "tick_ms": 28.063722222222232
+    },
+    {
+      "id": "gs-0068",
+      "players": 1101,
+      "capacity": 1400,
+      "utilization": 0.7864285714285715,
+      "cpu_percent": 63.62285714285714,
+      "tick_ms": 13.888857142857145
+    },
+    {
+      "id": "gs-0069",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 86,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0070",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 80,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0071",
+      "players": 1100,
+      "capacity": 1200,
+      "utilization": 0.9166666666666666,
+      "cpu_percent": 81,
+      "tick_ms": 27.222222222222214
+    },
+    {
+      "id": "gs-0072",
+      "players": 1100,
+      "capacity": 1400,
+      "utilization": 0.7857142857142857,
+      "cpu_percent": 65.57142857142857,
+      "tick_ms": 12.857142857142856
+    },
+    {
+      "id": "gs-0073",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 88,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0074",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 82,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0075",
+      "players": 1100,
+      "capacity": 1200,
+      "utilization": 0.9166666666666666,
+      "cpu_percent": 83,
+      "tick_ms": 31.222222222222214
+    },
+    {
+      "id": "gs-0076",
+      "players": 1100,
+      "capacity": 1400,
+      "utilization": 0.7857142857142857,
+      "cpu_percent": 67.57142857142857,
+      "tick_ms": 11.857142857142856
+    },
+    {
+      "id": "gs-0077",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 90,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0078",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 84,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0079",
+      "players": 1101,
+      "capacity": 1200,
+      "utilization": 0.9175,
+      "cpu_percent": 72.06,
+      "tick_ms": 30.381499999999996
+    },
+    {
+      "id": "gs-0080",
+      "players": 1102,
+      "capacity": 1400,
+      "utilization": 0.7871428571428571,
+      "cpu_percent": 69.67428571428572,
+      "tick_ms": 15.921142857142858
+    },
+    {
+      "id": "gs-0081",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 79,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0082",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 86,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0083",
+      "players": 1103,
+      "capacity": 1200,
+      "utilization": 0.9191666666666667,
+      "cpu_percent": 74.18,
+      "tick_ms": 29.70238888888889
+    },
+    {
+      "id": "gs-0084",
+      "players": 1103,
+      "capacity": 1400,
+      "utilization": 0.7878571428571428,
+      "cpu_percent": 71.72571428571428,
+      "tick_ms": 14.953999999999997
+    },
+    {
+      "id": "gs-0085",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 81,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0086",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 88,
+      "tick_ms": 47
+    },
+    {
+      "id": "gs-0087",
+      "players": 1102,
+      "capacity": 1200,
+      "utilization": 0.9183333333333333,
+      "cpu_percent": 76.12,
+      "tick_ms": 28.541555555555554
+    },
+    {
+      "id": "gs-0088",
+      "players": 1101,
+      "capacity": 1400,
+      "utilization": 0.7864285714285715,
+      "cpu_percent": 73.62285714285714,
+      "tick_ms": 13.888857142857145
+    },
+    {
+      "id": "gs-0089",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 83,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0090",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 90,
+      "tick_ms": 51
+    },
+    {
+      "id": "gs-0091",
+      "players": 1101,
+      "capacity": 1200,
+      "utilization": 0.9175,
+      "cpu_percent": 78.06,
+      "tick_ms": 27.381499999999996
+    },
+    {
+      "id": "gs-0092",
+      "players": 1102,
+      "capacity": 1400,
+      "utilization": 0.7871428571428571,
+      "cpu_percent": 62.674285714285716,
+      "tick_ms": 12.921142857142858
+    },
+    {
+      "id": "gs-0093",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 85,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0094",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 79,
+      "tick_ms": 50
+    },
+    {
+      "id": "gs-0095",
+      "players": 1102,
+      "capacity": 1200,
+      "utilization": 0.9183333333333333,
+      "cpu_percent": 80.12,
+      "tick_ms": 31.541555555555554
+    },
+    {
+      "id": "gs-0096",
+      "players": 1103,
+      "capacity": 1400,
+      "utilization": 0.7878571428571428,
+      "cpu_percent": 64.72571428571428,
+      "tick_ms": 11.953999999999997
+    },
+    {
+      "id": "gs-0097",
+      "players": 800,
+      "capacity": 800,
+      "utilization": 1,
+      "cpu_percent": 87,
+      "tick_ms": 48
+    },
+    {
+      "id": "gs-0098",
+      "players": 1000,
+      "capacity": 1000,
+      "utilization": 1,
+      "cpu_percent": 81,
+      "tick_ms": 49
+    },
+    {
+      "id": "gs-0099",
+      "players": 1100,
+      "capacity": 1200,
+      "utilization": 0.9166666666666666,
+      "cpu_percent": 82,
+      "tick_ms": 30.222222222222214
+    },
+    {
+      "id": "gs-0100",
+      "players": 1100,
+      "capacity": 1400,
+      "utilization": 0.7857142857142857,
+      "cpu_percent": 66.57142857142857,
+      "tick_ms": 15.857142857142856
+    }
+  ]
+}
