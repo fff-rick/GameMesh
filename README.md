@@ -32,12 +32,13 @@ go test ./...
 go vet ./...
 go test -race ./...
 go run ./cmd/registry-demo
-go run ./cmd/benchmark -servers 100 -capacity 1000 -players 10000 -workers 8
+go run ./cmd/benchmark -servers 100 -capacity 1000 -players 10000 -workers 8 -candidate-source cluster
+go run ./cmd/benchmark -servers 100 -capacity 1000 -players 10000 -workers 8 -candidate-source registry -registry-publish-every 100
 go test ./internal/registry -run '^$' -bench . -benchmem
 ```
 
 ## 当前边界
 
-Registry 是单进程内存中的 Control Plane 权威视图，不提供跨副本一致性，也未包含 Gateway、TCP/WebSocket、Redis、Kubernetes 或 Agones Adapter。当前 Benchmark 仍从 Simulator 快照取候选，下一步应增加可切换的 Candidate Source，才能端到端验证 Registry 对请求路径的收益。
+Registry 是单进程内存中的 Control Plane 权威视图，不提供跨副本一致性，也未包含 Gateway、TCP/WebSocket、Redis、Kubernetes 或 Agones Adapter。Benchmark 可切换 Simulator Snapshot 与 Registry Snapshot；`registry-publish-every` 明确控制基准中的负载视图陈旧度，不能将单次结果视为线上 SLA。
 
 RoundRobin 仍须遍历候选集；M2 应以 P2C、Least Connection / LoadScore 与预过滤索引做对照，而不是将 Registry 快照缓存误认为完整的调度性能优化。

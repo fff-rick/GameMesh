@@ -71,6 +71,19 @@ func (c *Cluster) Snapshots() []model.GameServerSnapshot {
 	return out
 }
 
+// Snapshot returns the current state of one GameServer. It is used by control
+// plane adapters to publish an allocation-induced heartbeat without rebuilding
+// the entire simulated cluster snapshot.
+func (c *Cluster) Snapshot(serverID string) (model.GameServerSnapshot, error) {
+	c.mu.RLock()
+	s, ok := c.servers[serverID]
+	c.mu.RUnlock()
+	if !ok {
+		return model.GameServerSnapshot{}, fmt.Errorf("server %q not found", serverID)
+	}
+	return s.Snapshot(), nil
+}
+
 func (c *Cluster) Allocate(serverID string, players int) error {
 	c.mu.RLock()
 	s, ok := c.servers[serverID]
