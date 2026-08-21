@@ -90,7 +90,7 @@ func Run(ctx context.Context, cfg Config, cluster *simulator.Cluster, strategy s
 				before := time.Now()
 				allocated := false
 				for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
-					selection, err := strategy.Schedule(ctx, req, cluster.Snapshots())
+					selection, err := strategy.Schedule(ctx, req, scheduler.BorrowCandidates(cluster.Snapshots()))
 					if err != nil {
 						break
 					}

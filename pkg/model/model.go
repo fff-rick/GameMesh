@@ -48,7 +48,9 @@ type ServerMetrics struct {
 // GameServerSnapshot is an immutable view consumed by schedulers.
 type GameServerSnapshot struct {
 	ID             string        `json:"id"`
+	Address        string        `json:"address,omitempty"`
 	Region         string        `json:"region"`
+	Zone           string        `json:"zone,omitempty"`
 	Version        string        `json:"version"`
 	State          ServerState   `json:"state"`
 	Capacity       int           `json:"capacity"`

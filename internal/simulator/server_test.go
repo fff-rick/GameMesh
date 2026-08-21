@@ -49,3 +49,16 @@ func TestMetricsIncreaseWithLoad(t *testing.T) {
 		t.Fatalf("tick latency did not increase")
 	}
 }
+
+var benchmarkSnapshotsSink []model.GameServerSnapshot
+
+func BenchmarkClusterSnapshots1000Servers(b *testing.B) {
+	cluster := NewHeterogeneousCluster(1000, 1000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkSnapshotsSink = cluster.Snapshots()
+	}
+	if len(benchmarkSnapshotsSink) != 1000 {
+		b.Fatal("unexpected snapshot size")
+	}
+}
