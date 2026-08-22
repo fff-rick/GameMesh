@@ -2,6 +2,16 @@
 
 GameMesh 是一个面向多人在线游戏的自适应流量与 GameServer 调度层。
 
+## 与 MMO 的边界
+
+GameMesh 不是玩家组队或公平匹配系统。MMO 是 `Player / Party / Ticket / Match`
+的业务事实源：它决定哪些玩家组成一场对局，并保存 Match 生命周期、评分和
+连接票据。GameMesh 只接收**已成局**的 `match_id` 及其区域、版本等放置约束，负责
+运行时准入、健康隔离、连接路由和负载/容量策略。Agones 负责最终的原子
+GameServer Allocation 与实例生命周期，避免 Registry 与编排器形成双重占用事实源。
+
+完整契约见 [MMO 集成边界](docs/11_mmo_integration_boundary.md)。
+
 当前版本：**M1 / GameServer Registry**（M0 Baseline 已保留）。
 
 ## M1 已实现
@@ -32,12 +42,13 @@ go test ./...
 go vet ./...
 go test -race ./...
 go run ./cmd/registry-demo
-go run ./cmd/benchmark -servers 100 -capacity 1000 -players 10000 -workers 8
+go run ./cmd/benchmark -servers 100 -capacity 1000 -players 10000 -workers 8 -candidate-source cluster
+go run ./cmd/benchmark -servers 100 -capacity 1000 -players 10000 -workers 8 -candidate-source registry -registry-publish-every 100
 go test ./internal/registry -run '^$' -bench . -benchmem
 ```
 
 ## 当前边界
 
-Registry 是单进程内存中的 Control Plane 权威视图，不提供跨副本一致性，也未包含 Gateway、TCP/WebSocket、Redis、Kubernetes 或 Agones Adapter。当前 Benchmark 仍从 Simulator 快照取候选，下一步应增加可切换的 Candidate Source，才能端到端验证 Registry 对请求路径的收益。
+Registry 是单进程内存中的健康与容量读模型，不提供跨副本一致性，也未包含 Gateway、TCP/WebSocket、Redis、Kubernetes 或 Agones Adapter。它不是 Match 或最终实例占用的事实源。Benchmark 可切换 Simulator Snapshot 与 Registry Snapshot；`registry-publish-every` 明确控制基准中的负载视图陈旧度，不能将单次结果视为线上 SLA。
 
 RoundRobin 仍须遍历候选集；M2 应以 P2C、Least Connection / LoadScore 与预过滤索引做对照，而不是将 Registry 快照缓存误认为完整的调度性能优化。

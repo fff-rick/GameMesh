@@ -11,6 +11,13 @@ M1 的目标不是做分布式注册中心，而是建立 GameMesh 后续所有�
 5. Scheduler 获取候选集合时不能每个请求都重新扫描、加锁和复制整个模拟集群；
 6. 后续可替换为 Kubernetes/Agones/etcd Adapter，而不破坏领域模型。
 
+### 与 MMO 的边界
+
+M1 Registry 不保存 Player、Party、Ticket、评分或 Match 业务状态。MMO 负责形成并
+持久化 Match Binding；GameMesh 仅把 Registry 用于已成局 Match 的运行时健康判断、
+连接路由和容量策略。Registry 也不是最终实例占用的事实源：接入 Agones 后，具体
+GameServer 的原子 Allocation 仍由 Agones 完成。
+
 ## 2. 新增组件
 
 ### `internal/registry/Registry`

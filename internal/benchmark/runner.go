@@ -35,6 +35,7 @@ type ServerDistribution struct {
 
 type Result struct {
 	Strategy              string               `json:"strategy"`
+	CandidateSource       string               `json:"candidate_source"`
 	PlayersRequested      int                  `json:"players_requested"`
 	SuccessfulAllocations int64                `json:"successful_allocations"`
 	FailedAllocations     int64                `json:"failed_allocations"`
@@ -52,6 +53,20 @@ type Result struct {
 }
 
 func Run(ctx context.Context, cfg Config, cluster *simulator.Cluster, strategy scheduler.Scheduler) Result {
+	result, err := RunWithSource(ctx, cfg, cluster, strategy, NewClusterCandidateSource(cluster))
+	if err != nil {
+		panic(err)
+	}
+	return result
+}
+
+// RunWithSource executes an allocation experiment against a specified
+// candidate source. The source is flushed before reporting so final Registry
+// state is observable even when its batched publish interval has not elapsed.
+func RunWithSource(ctx context.Context, cfg Config, cluster *simulator.Cluster, strategy scheduler.Scheduler, source CandidateSource) (Result, error) {
+	if source == nil {
+		return Result{}, fmt.Errorf("candidate source is required")
+	}
 	if cfg.Players <= 0 {
 		cfg.Players = 10000
 	}
@@ -68,6 +83,8 @@ func Run(ctx context.Context, cfg Config, cluster *simulator.Cluster, strategy s
 	var failed atomic.Int64
 	var retries atomic.Int64
 	var wg sync.WaitGroup
+	var sourceErr error
+	var sourceErrOnce sync.Once
 
 	started := time.Now()
 	for w := 0; w < cfg.Workers; w++ {
@@ -90,7 +107,7 @@ func Run(ctx context.Context, cfg Config, cluster *simulator.Cluster, strategy s
 				before := time.Now()
 				allocated := false
 				for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
-					selection, err := strategy.Schedule(ctx, req, scheduler.BorrowCandidates(cluster.Snapshots()))
+					selection, err := strategy.Schedule(ctx, req, source.Candidates())
 					if err != nil {
 						break
 					}
@@ -99,6 +116,10 @@ func Run(ctx context.Context, cfg Config, cluster *simulator.Cluster, strategy s
 							retries.Add(1)
 							continue
 						}
+						break
+					}
+					if err := source.AfterAllocation(selection.GameServerID); err != nil {
+						sourceErrOnce.Do(func() { sourceErr = err })
 						break
 					}
 					allocated = true
@@ -119,11 +140,17 @@ func Run(ctx context.Context, cfg Config, cluster *simulator.Cluster, strategy s
 	close(jobs)
 	wg.Wait()
 	duration := time.Since(started)
+	if sourceErr != nil {
+		return Result{}, fmt.Errorf("sync candidate source: %w", sourceErr)
+	}
+	if err := source.Flush(); err != nil {
+		return Result{}, err
+	}
 
-	return buildResult(strategy.Name(), cfg.Players, successful.Load(), failed.Load(), retries.Load(), duration, latencies, cluster.Snapshots())
+	return buildResult(strategy.Name(), source.Name(), cfg.Players, successful.Load(), failed.Load(), retries.Load(), duration, latencies, cluster.Snapshots()), nil
 }
 
-func buildResult(strategy string, requested int, successful, failed, retries int64, duration time.Duration, latencies []time.Duration, snapshots []model.GameServerSnapshot) Result {
+func buildResult(strategy, candidateSource string, requested int, successful, failed, retries int64, duration time.Duration, latencies []time.Duration, snapshots []model.GameServerSnapshot) Result {
 	validLatencies := make([]time.Duration, 0, len(latencies))
 	for _, d := range latencies {
 		if d > 0 {
@@ -159,7 +186,7 @@ func buildResult(strategy string, requested int, successful, failed, retries int
 	}
 
 	return Result{
-		Strategy: strategy, PlayersRequested: requested,
+		Strategy: strategy, CandidateSource: candidateSource, PlayersRequested: requested,
 		SuccessfulAllocations: successful, FailedAllocations: failed, AllocationRetries: retries,
 		DurationMillis: duration.Seconds() * 1000, ThroughputPerSecond: throughput,
 		ScheduleP50Micros:  percentileMicros(validLatencies, 0.50),

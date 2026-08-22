@@ -6,7 +6,7 @@
 
 - 网关连接数、CPU、内存快速升高；
 - 新玩家持续进入高负载 GameServer；
-- Matchmaking 队列迅速积压；
+- 已成局 Match 的接入请求与重连迅速积压；
 - 某些 Region、Room、Match 成为热点；
 - 服务扩容存在启动与预热时间，CPU 高了再扩容往往已经偏晚；
 - Retry / Reconnect 进一步放大故障，形成雪崩；
@@ -18,9 +18,12 @@ GameMesh 希望在游戏客户端与后端 GameServer 之间增加一个长期�
 
 ## 2. 项目定位
 
-**GameMesh = Game-aware Gateway + Semantic Load Balancer + Adaptive Controller + GameServer Scheduler**
+**GameMesh = Game Runtime Gateway + Session Router + Adaptive Traffic Controller + GameServer Placement Policy**
 
-它不是单纯的反向代理，也不是完整的游戏后端平台，而是一个可以集成到已有游戏架构中的“游戏基础设施控制与调度层”。
+它不是单纯的反向代理，也不是完整的游戏后端平台。与 MMO 集成时，MMO 是玩家、
+Party、Ticket、5V5 分队、评分和 Match 生命周期的唯一事实源；GameMesh 只处理已成局
+Match 的运行时接入、健康隔离、容量策略和流量保护。Agones 仍是最终原子实例分配与
+生命周期的权威。
 
 ### 2.1 正常状态
 
@@ -32,7 +35,7 @@ GameMesh 希望在游戏客户端与后端 GameServer 之间增加一个长期�
 - Session Affinity；
 - 基础负载均衡；
 - GameServer 容量感知；
-- Region / Party / Match 路由；
+- 消费 MMO 已创建 Match Binding 的 Region / Match 路由；
 - 指标采集。
 
 ### 2.2 高负载状态
@@ -40,11 +43,11 @@ GameMesh 希望在游戏客户端与后端 GameServer 之间增加一个长期�
 负责：
 
 - 停止向高压力 GameServer 分配新玩家；
-- 新 Match 优先调度到低负载实例；
+- 根据健康、容量与过载策略接受或拒绝 MMO 的新 Match 放置请求；
 - 动态调整路由权重；
 - 触发 GameServer Fleet 扩容；
-- Gateway / Match Worker 横向扩容；
-- 热点 Region / Match 队列分片；
+- Gateway 横向扩容，并向 MMO 输出容量压力信号；
+- 热点 Region 的连接与已成局 Match 接入隔离；
 - 预留 Ready GameServer Buffer。
 
 ### 2.3 过载状态
@@ -67,19 +70,19 @@ GameMesh 希望在游戏客户端与后端 GameServer 之间增加一个长期�
 
 在线人数从 10 万在数分钟内增长到 50 万甚至更高。
 
-GameMesh 根据连接增长率、Match Queue 长度、Ready GameServer 数量、Tick Latency 等指标提前进入扩容状态，而不是只等待 CPU 超阈值。
+GameMesh 根据连接增长率、MMO 输出的队列压力、Ready GameServer 数量、Tick Latency 等指标提前进入保护或扩容状态，而不是只等待 CPU 超阈值。
 
 ### 场景 B：部分服务器负载失衡
 
 某些服务器 90% 负载，另一些只有 30%。
 
-GameMesh 不再仅按 Round Robin 分配，而是计算 GameServer Load Score，并只把**新连接 / 新 Match**调度给更合适的服务器。
+GameMesh 不再仅按 Round Robin 处理新连接。在共享 Lobby、Room 或 World Shard 等可复用实例场景，它可计算 Load Score 并放置新会话；5V5 专属实例的最终占用仍由 Agones 原子完成。
 
-### 场景 C：Party / Match 语义路由
+### 场景 C：已成局 Match 的语义路由
 
-同一个 Party、Room 或 Match 的玩家必须进入同一逻辑 GameServer。
+MMO 已决定 Party 如何组成 Match，并持久化 `match_id -> GameServer` Binding。
 
-GameMesh 根据业务 Key 做一致性路由与 Session Affinity，而不是把每个玩家独立随机分配。
+GameMesh 验证 MMO 签发的连接票据，并根据该 Binding 做 Session Affinity；它不形成 Party，也不重新选择运行中的 Match 的目标实例。
 
 ### 场景 D：服务器压力超过安全阈值
 
@@ -110,13 +113,12 @@ GameMesh 根据业务 Key 做一致性路由与 Session Affinity，而不是把�
 
 根据游戏上下文路由：
 
-- `player_id`
-- `party_id`
-- `room_id`
 - `match_id`
 - `region`
 - `game_mode`
 - `server_version`
+
+这些字段是 MMO 已成局 Match 的放置约束或连接票据声明，不用于 GameMesh 自行组队或创建 Match。
 
 用于实现“业务语义负载均衡”。
 
@@ -130,8 +132,7 @@ GameMesh 根据业务 Key 做一致性路由与 Session Affinity，而不是把�
 - P2C / Least Load；
 - Consistent Hash；
 - Region Aware；
-- Party Aware；
-- Match Aware；
+- Match Binding Aware（消费 MMO Binding，不创建 Binding）；
 - Composite Load Score。
 
 ### 4.4 GameServer Registry
@@ -165,11 +166,11 @@ GameMesh 根据业务 Key 做一致性路由与 Session Affinity，而不是把�
 
 负责：
 
-- 为新 Match 选择 GameServer；
-- 为新 Room 选择 GameServer；
+- 为 MMO 已成局 Match 评估可用 Region/Fleet 与运行时准入；
+- 为共享实例场景的新 Room/Session 选择候选池；
 - 避免调度到即将 Drain 的实例；
 - 根据版本 / Region / Capacity 过滤候选节点；
-- 与 Agones / Kubernetes 等基础设施交互。
+- 将合格约束交给 Agones 执行最终原子实例分配；
 
 ### 4.7 Autoscaling Policy Engine
 
@@ -234,7 +235,7 @@ GameMesh 不应把所有实现写死在核心进程中，而是区分：
 - Autoscaling Policy；
 - Prediction Strategy；
 - Infrastructure Adapter；
-- External Matchmaker Adapter。
+- MMO Placement / Match Binding Adapter。
 
 后续可采用 gRPC / HashiCorp go-plugin 等进程隔离方式。
 
@@ -245,7 +246,6 @@ GameMesh 不应把所有实现写死在核心进程中，而是区分：
 - Kubernetes Adapter；
 - Agones Adapter；
 - Prometheus Adapter；
-- Open Match Adapter（可选）；
 - 静态 GameServer Registry Adapter。
 
 ---
@@ -265,6 +265,7 @@ GameMesh 不应把所有实现写死在核心进程中，而是区分：
 - 自研 Kubernetes 替代品；
 - 自研完整 Envoy 替代品；
 - 自研完整 Open Match 替代品。
+- 玩家组队、Match Ticket、MMR/Elo、Match Repository；这些由 MMO 提供。
 
 尤其是“运行中的一场 MOBA 对局动态迁移”需要 State Snapshot、复制、一致性与 Session Migration，是后续独立研究主题。
 
@@ -277,10 +278,9 @@ GameMesh 最终不是靠功能数量证明价值，而是靠对比实验：
 1. 与 Round Robin 相比，是否能降低 GameServer 负载方差；
 2. 突发流量下是否能减少过载实例数量；
 3. 是否能在扩容完成前通过 Admission / Load Shedding 避免雪崩；
-4. Session / Party / Match 是否能稳定落到正确节点；
+4. MMO 已创建的 Match Binding 是否能稳定地被 Gateway 路由到正确节点；
 5. 在节点故障、扩缩容过程中，路由是否能快速收敛；
 6. GameMesh 自身加入后，对请求 P99 延迟增加是否可控；
 7. 预测式策略是否能比纯 CPU 阈值更早触发扩容。
 
 这些数据将作为项目最终简历与技术报告的核心证据。
-

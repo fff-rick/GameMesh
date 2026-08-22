@@ -20,13 +20,14 @@ MVP 不是做出一个完整商业游戏平台，而是证明下面这句话：
 
 > 当前文档包属于 M0 的立项阶段，还未开始编码。
 
-### M1：基础 Gateway
+### M1：基础 Gateway 与 MMO Match 接入
 
 - TCP 或 WebSocket 至少一种；
 - Connection Lifecycle；
 - Session；
 - GameServer Registry；
 - Round Robin Baseline。
+- 消费 MMO 已成局 Match Binding；不实现玩家组队或 Ticket 队列。
 
 ### M2：Game-aware Balancer
 
@@ -34,7 +35,7 @@ MVP 不是做出一个完整商业游戏平台，而是证明下面这句话：
 - P2C；
 - Load Score；
 - Consistent Hash；
-- Match Affinity；
+- Match Binding 路由（消费 MMO Binding）；
 - Region / Version Filter。
 
 ### M3：Adaptive Controller
@@ -50,7 +51,7 @@ MVP 不是做出一个完整商业游戏平台，而是证明下面这句话：
 
 - Rate Limit；
 - Admission Control；
-- Queue；
+- 连接准入队列（不管理 MMO 匹配队列）；
 - Load Shedding；
 - High Load GameServer Blackout；
 - Retry / Reconnect 抑制策略。
@@ -86,7 +87,6 @@ MVP 不是做出一个完整商业游戏平台，而是证明下面这句话：
 
 - Control Plane Plugin；
 - Agones Adapter 完整抽象；
-- Open Match Adapter；
 - 可选 Envoy / xDS PoC。
 
 ---
@@ -97,6 +97,7 @@ MVP 不是做出一个完整商业游戏平台，而是证明下面这句话：
 
 - QUIC + TCP + UDP + WebSocket 全协议同时做；
 - 完整 Matchmaking 算法平台；
+- Player / Party / Ticket / MMR / Elo / Match Repository（由 MMO 负责）；
 - AI 预测模型；
 - 多云多 Region；
 - Battle Live Migration；
@@ -161,7 +162,7 @@ MVP 不是做出一个完整商业游戏平台，而是证明下面这句话：
 观察：
 
 - Registry 收敛时间；
-- 新 Match 错误分配数量；
+- MMO 已成局 Match 的错误放置或错误路由数量；
 - Failover 时间；
 - 现有 Session 影响范围。
 
@@ -276,4 +277,3 @@ GameServer 从创建到 Ready 人为设置 20~60 秒启动时间。
 6. 再进入 M1 编码。
 
 这样从第一天开始，每新增一个策略都可以有数据对比，而不是开发到最后才补压测。
-

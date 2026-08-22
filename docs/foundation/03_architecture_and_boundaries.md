@@ -5,6 +5,7 @@
 ```mermaid
 flowchart TB
     C[Game Clients] --> G[GameMesh Data Plane]
+    MMO[MMO Matchmaking\nPlayer / Party / Ticket / Match] -->|已成局 Match + Placement 约束| CP
 
     subgraph DP[Data Plane - Go]
         G --> SESS[Session Manager]
@@ -30,7 +31,6 @@ flowchart TB
     CP --> DP
     CP --> AG[Agones Adapter]
     CP --> K8S[Kubernetes Adapter]
-    CP --> OM[Open Match Adapter - Optional]
     AG --> GSPOOL[GameServer Fleet]
 ```
 
@@ -163,13 +163,10 @@ GameMesh 路由至少区分三类：
 
 同一玩家在 Session 有效期内优先回到相同 Gateway / Lobby Server。
 
-### Party Affinity
-
-同一 Party 在 Match 创建前保持同一逻辑上下文。
-
 ### Match Affinity
 
-Match 一旦被分配到 GameServer，在 Match 生命周期内固定到该服务器。
+MMO 创建并持久化 Match Binding；GameMesh 只消费该 Binding。Match 一旦被分配到
+GameServer，在生命周期内固定到该服务器。
 
 因此路由不是简单：
 
@@ -177,11 +174,10 @@ Match 一旦被分配到 GameServer，在 Match 生命周期内固定到该服�
 
 而是：
 
-1. 是否已有 Match Binding？
-2. 是否已有 Party Binding？
-3. 是否需要按 Region / Version 过滤？
-4. 候选 GameServer 是否 Ready / Healthy？
-5. 再执行 Load Balance。
+1. MMO ticket 是否有效，且是否已有 Match Binding？
+2. 是否需要按 Region / Version 过滤？
+3. 目标实例是否 Ready / Healthy？
+4. 对尚未放置的共享会话，再执行 Load Balance。
 
 ---
 
@@ -236,7 +232,7 @@ Match 一旦被分配到 GameServer，在 Match 生命周期内固定到该服�
 
 - Scaling Policy；
 - Prediction Policy；
-- Matchmaker Adapter；
+- MMO Placement / Match Binding Adapter；
 - GameServer Orchestrator Adapter。
 
 后续可以使用：
@@ -251,7 +247,7 @@ Adapter 不应该污染核心领域模型。
 
 例如：
 
-- Agones Adapter 把内部 `AllocateGameServer` 映射为 Agones Allocator 请求；
+- Agones Adapter 把 GameMesh 的合格 Region/Fleet 约束映射为 Agones Allocator 请求；最终实例占用仍以 Agones 结果为准；
 - Kubernetes Adapter 把 `ScaleGateway` 映射为 Deployment Scale / HPA 相关操作；
 - Static Adapter 允许本机测试，不依赖 Kubernetes。
 
@@ -305,8 +301,8 @@ GameMesh 不应追求所有状态强一致。
 
 ### 强约束
 
-- 同一 Match 的最终 GameServer Binding；
-- Allocation 幂等；
+- MMO 持久化的同一 Match 最终 GameServer Binding；
+- MMO 的业务幂等与 Agones 的最终 Allocation 原子性；
 - Session Token 安全校验。
 
 ### 最终一致即可
@@ -330,8 +326,8 @@ GameMesh 不应追求所有状态强一致。
 
 - 新连接；
 - 新 Session；
-- 新 Party / Match Binding；
-- 新 GameServer Allocation；
+- 消费 MMO 已创建的 Match Binding；
+- 已成局 Match 的准入与 GameServer Allocation 请求；
 - GameServer 加入 / 退出；
 - Gateway Scale；
 - Overload Protection。
@@ -344,4 +340,3 @@ GameMesh 不应追求所有状态强一致。
 - 全球多活数据库。
 
 这能让项目保持“够难，但可完成”。
-
