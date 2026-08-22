@@ -227,11 +227,11 @@ GameMesh 希望进一步理解：
 
 ## 6. Open Match 调研
 
-Open Match 是用于构建可扩展 Matchmaker 的开源框架，其目标是解决大规模 Ticket、查询和并发 Match Generation 等通用问题，同时让开发者自定义 Matchmaking Logic。
+Open Match 是用于构建可扩展 Matchmaker 的开源框架，其目标是解决大规模 Ticket、查询和并发 Match Generation 等通用问题，同时让开发者自定义 Matchmaking Logic。当前项目已有 MMO 负责这一业务边界，因此 Open Match 不再是 GameMesh 的集成目标。
 
 ### 6.1 与 GameMesh 的关系
 
-Open Match 适合负责：
+在没有 MMO 的独立部署中，Open Match 可负责：
 
 - Match Ticket；
 - Pool；
@@ -246,9 +246,9 @@ GameMesh 更适合负责：
 - Gateway 路由；
 - 扩缩容与过载保护。
 
-理想关系：
+与 MMO 集成时，目标关系是：
 
-`Open Match -> GameMesh Scheduler -> Agones Allocator -> GameServer`
+`MMO Matchmaking -> GameMesh Runtime Layer -> Agones Allocator -> GameServer`
 
 ### 6.2 当前风险
 
@@ -258,12 +258,12 @@ GameMesh 更适合负责：
 
 - 其设计仍值得参考；
 - 但不适合把 MVP 的核心架构锁死在 Open Match 上；
-- 应通过 Adapter 接入；
-- 本地 Match Simulator / Simple Matchmaker 应作为默认测试实现。
+- 不应作为 GameMesh 的 Adapter 接入；
+- 不应在 GameMesh 内维护第二套 Match Simulator / Simple Matchmaker。
 
 ### 6.3 结论
 
-**Open Match = 可选集成，不是 MVP 硬依赖。**
+**Open Match = 独立部署时的参考方案；与 MMO 集成时不接入。**
 
 ---
 
@@ -319,7 +319,7 @@ HashiCorp `go-plugin` 使用独立进程 + RPC / gRPC 实现插件系统，被 T
 | Pod / Node 编排 | Kubernetes | 不应重复造轮子 |
 | Metrics | Prometheus | 标准生态 |
 | 通用代理能力 | MVP 自研最小集；后期可接 Envoy | 平衡学习价值与工程成本 |
-| Matchmaking Framework | 自建简单实现 + Open Match Adapter | 避免版本绑定 |
+| Player Matchmaking | MMO | 避免 Player/Party/Ticket/Match 的双事实源 |
 | 动态策略插件 | go-plugin / gRPC 可选 | 适合控制面 |
 
 ---
@@ -376,4 +376,3 @@ Kubernetes / Agones 状态存在 eventual consistency。
 | 完整产品难度 | 10/10 | 若追求生产级完整度，工程量巨大 |
 
 **总体建议：立项。**
-
