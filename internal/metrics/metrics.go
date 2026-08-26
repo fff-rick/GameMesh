@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Metrics struct {
@@ -23,10 +24,12 @@ type Metrics struct {
 	mu                sync.Mutex
 	disconnects       map[string]uint64
 	authResults       map[string]uint64
+	backendRPCResults map[string]uint64
+	backendRPCLatency map[string]latencyAgg
 }
 
 func New(gatewayID string) *Metrics {
-	return &Metrics{gatewayID: gatewayID, disconnects: map[string]uint64{}, authResults: map[string]uint64{}}
+	return &Metrics{gatewayID: gatewayID, disconnects: map[string]uint64{}, authResults: map[string]uint64{}, backendRPCResults: map[string]uint64{}, backendRPCLatency: map[string]latencyAgg{}}
 }
 func (m *Metrics) ConnectionOpened() { m.connections.Add(1); m.connectionsTotal.Add(1) }
 func (m *Metrics) ConnectionClosed(reason string) {
@@ -44,6 +47,25 @@ func (m *Metrics) AuthResult(result string) {
 	m.authResults[result]++
 	m.mu.Unlock()
 }
+
+type latencyAgg struct {
+	Count      uint64
+	SumSeconds float64
+}
+
+func metricKey(parts ...string) string { return strings.Join(parts, "\x00") }
+
+func (m *Metrics) BackendRPC(backendType, method, result string, d time.Duration) {
+	m.mu.Lock()
+	m.backendRPCResults[metricKey(backendType, method, result)]++
+	k := metricKey(backendType, method)
+	a := m.backendRPCLatency[k]
+	a.Count++
+	a.SumSeconds += d.Seconds()
+	m.backendRPCLatency[k] = a
+	m.mu.Unlock()
+}
+
 func (m *Metrics) ObserveQueueDepth(n int) {
 	for {
 		old := m.queueDepthMax.Load()
@@ -83,6 +105,26 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 	sort.Strings(authKeys)
 	for _, k := range authKeys {
 		fmt.Fprintf(w, "game_gateway_auth_total{gateway_id=\"%s\",result=\"%s\"} %d\n", gid, escape(k), m.authResults[k])
+	}
+	rpcKeys := make([]string, 0, len(m.backendRPCResults))
+	for k := range m.backendRPCResults {
+		rpcKeys = append(rpcKeys, k)
+	}
+	sort.Strings(rpcKeys)
+	for _, k := range rpcKeys {
+		parts := strings.Split(k, "\x00")
+		fmt.Fprintf(w, "game_gateway_backend_rpc_total{backend_type=\"%s\",method=\"%s\",result=\"%s\"} %d\n", escape(parts[0]), escape(parts[1]), escape(parts[2]), m.backendRPCResults[k])
+	}
+	latKeys := make([]string, 0, len(m.backendRPCLatency))
+	for k := range m.backendRPCLatency {
+		latKeys = append(latKeys, k)
+	}
+	sort.Strings(latKeys)
+	for _, k := range latKeys {
+		parts := strings.Split(k, "\x00")
+		a := m.backendRPCLatency[k]
+		fmt.Fprintf(w, "game_gateway_backend_rpc_seconds_count{backend_type=\"%s\",method=\"%s\"} %d\n", escape(parts[0]), escape(parts[1]), a.Count)
+		fmt.Fprintf(w, "game_gateway_backend_rpc_seconds_sum{backend_type=\"%s\",method=\"%s\"} %.9f\n", escape(parts[0]), escape(parts[1]), a.SumSeconds)
 	}
 	m.mu.Unlock()
 }

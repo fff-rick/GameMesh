@@ -132,3 +132,59 @@ func consumeBytes(b []byte) ([]byte, []byte, bool) {
 	b = b[n:]
 	return b[:int(ln)], b[int(ln):], true
 }
+
+type ErrorResponse struct {
+	ErrorCode string
+	Retryable bool
+}
+
+func MarshalErrorResponse(v ErrorResponse) []byte {
+	var b []byte
+	if v.ErrorCode != "" {
+		b = appendBytesField(b, 1, []byte(v.ErrorCode))
+	}
+	if v.Retryable {
+		b = appendVarintField(b, 2, 1)
+	}
+	return b
+}
+
+func UnmarshalErrorResponse(b []byte) (ErrorResponse, error) {
+	var out ErrorResponse
+	for len(b) > 0 {
+		field, wire, rest, ok := consumeFieldKey(b)
+		if !ok {
+			return ErrorResponse{}, ErrMalformedControlPayload
+		}
+		b = rest
+		switch field {
+		case 1:
+			if wire != 2 {
+				return ErrorResponse{}, ErrMalformedControlPayload
+			}
+			v, rest, ok := consumeBytes(b)
+			if !ok {
+				return ErrorResponse{}, ErrMalformedControlPayload
+			}
+			out.ErrorCode = string(v)
+			b = rest
+		case 2:
+			if wire != 0 {
+				return ErrorResponse{}, ErrMalformedControlPayload
+			}
+			v, n := consumeVarint(b)
+			if n <= 0 {
+				return ErrorResponse{}, ErrMalformedControlPayload
+			}
+			out.Retryable = v != 0
+			b = b[n:]
+		default:
+			var skipped bool
+			b, skipped = skipField(wire, b)
+			if !skipped {
+				return ErrorResponse{}, ErrMalformedControlPayload
+			}
+		}
+	}
+	return out, nil
+}

@@ -11,6 +11,7 @@ enum MessageType {
   MESSAGE_TYPE_AUTH_RESULT = 11;
   MESSAGE_TYPE_HEARTBEAT_REQUEST = 12;
   MESSAGE_TYPE_HEARTBEAT_RESPONSE = 13;
+  MESSAGE_TYPE_ERROR = 14;
 }
 
 message Envelope {
@@ -33,4 +34,9 @@ message AuthResult {
   string user_id = 2;
   string session_id = 3;
   string error_code = 4;
+}
+
+message ErrorResponse {
+  string error_code = 1;
+  bool retryable = 2;
 }

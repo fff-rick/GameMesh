@@ -5,9 +5,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"game-gateway/internal/auth"
+	"game-gateway/internal/backend"
 	"game-gateway/internal/config"
 	"game-gateway/internal/metrics"
 	"game-gateway/internal/protocol"
+	"game-gateway/internal/routing"
 	"game-gateway/internal/session"
 	"game-gateway/internal/ws"
 	"log/slog"
@@ -27,6 +29,22 @@ func WithAuthenticator(a auth.Authenticator) Option {
 	}
 }
 
+func WithRouter(r routing.Resolver) Option {
+	return func(s *Server) {
+		if r != nil {
+			s.router = r
+		}
+	}
+}
+
+func WithBackendRegistry(r *backend.Registry) Option {
+	return func(s *Server) {
+		if r != nil {
+			s.backends = r
+		}
+	}
+}
+
 type Server struct {
 	cfg       config.Config
 	gatewayID string
@@ -41,6 +59,9 @@ type Server struct {
 	unauthRejects atomic.Uint64
 	heartbeatStop chan struct{}
 	heartbeatWG   sync.WaitGroup
+	router        routing.Resolver
+	backends      *backend.Registry
+	backendCaller *backend.Caller
 }
 
 func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Option) *Server {
@@ -53,6 +74,9 @@ func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Optio
 		authenticator: auth.DevAuthenticator{},
 		sessions:      session.NewManager(),
 		heartbeatStop: make(chan struct{}),
+		router:        routing.NewStaticRouter(),
+		backends:      backend.NewRegistry(),
+		backendCaller: backend.NewCaller(cfg.BackendRPCTimeout),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -158,11 +182,78 @@ func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
 		c.logger.Warn("unauthenticated business message rejected", "message_type", env.MessageType, "request_id", env.RequestID)
 		return
 	}
+	if env.MessageType >= protocol.BusinessMessageMin {
+		s.handleBusiness(c, env)
+		return
+	}
 	if env.MessageType != protocol.MessageTypeEchoRequest {
 		return
 	}
 	resp := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeEchoResponse, RequestID: env.RequestID, Payload: env.Payload, TimestampUnixMS: time.Now().UnixMilli()}
 	s.enqueueOrClose(c, resp)
+}
+
+func (s *Server) handleBusiness(c *Connection, env protocol.Envelope) {
+	route, err := s.router.Resolve(c.UserID(), env.MessageType)
+	if err != nil {
+		s.sendRoutingError(c, env.RequestID, err)
+		return
+	}
+	client, err := s.backends.Get(route.Instance.ID)
+	if err != nil {
+		s.metrics.BackendRPC(route.BackendType, "Handle", "unavailable", 0)
+		s.sendError(c, env.RequestID, "backend_unavailable", true)
+		return
+	}
+	started := time.Now()
+	resp, err := s.backendCaller.Call(c.ctx, client, backend.Request{
+		UserID: c.UserID(), SessionID: c.SessionID(), RoomID: route.RoomID, MessageType: env.MessageType, RequestID: env.RequestID, Payload: append([]byte(nil), env.Payload...), TimestampUnixMS: env.TimestampUnixMS,
+	})
+	if err != nil {
+		if errors.Is(err, backend.ErrTimeout) {
+			s.metrics.BackendRPC(route.BackendType, "Handle", "timeout", time.Since(started))
+			s.sendError(c, env.RequestID, "backend_timeout", true)
+			return
+		}
+		if errors.Is(err, backend.ErrUnavailable) {
+			s.metrics.BackendRPC(route.BackendType, "Handle", "unavailable", time.Since(started))
+			s.sendError(c, env.RequestID, "backend_unavailable", true)
+			return
+		}
+		var be *backend.BackendError
+		if errors.As(err, &be) {
+			s.metrics.BackendRPC(route.BackendType, "Handle", "backend_error", time.Since(started))
+			s.sendError(c, env.RequestID, be.Code, false)
+			return
+		}
+		s.metrics.BackendRPC(route.BackendType, "Handle", "internal_error", time.Since(started))
+		s.sendError(c, env.RequestID, "backend_internal", false)
+		return
+	}
+	s.metrics.BackendRPC(route.BackendType, "Handle", "success", time.Since(started))
+	outType := resp.MessageType
+	if outType < protocol.BusinessMessageMin {
+		s.sendError(c, env.RequestID, "backend_invalid_response", false)
+		return
+	}
+	s.enqueueOrClose(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: outType, RequestID: env.RequestID, Payload: resp.Payload, TimestampUnixMS: time.Now().UnixMilli()})
+}
+
+func (s *Server) sendRoutingError(c *Connection, requestID string, err error) {
+	switch {
+	case errors.Is(err, routing.ErrUnknownMessageType):
+		s.sendError(c, requestID, "routing_unknown_message_type", false)
+	case errors.Is(err, routing.ErrUserRoomNotFound):
+		s.sendError(c, requestID, "routing_user_room_not_found", true)
+	case errors.Is(err, routing.ErrRoomInstanceNotFound), errors.Is(err, routing.ErrBackendTypeMismatch):
+		s.sendError(c, requestID, "routing_backend_unavailable", true)
+	default:
+		s.sendError(c, requestID, "routing_internal", false)
+	}
+}
+
+func (s *Server) sendError(c *Connection, requestID, code string, retryable bool) {
+	s.enqueueOrClose(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeError, RequestID: requestID, Payload: protocol.MarshalErrorResponse(protocol.ErrorResponse{ErrorCode: code, Retryable: retryable}), TimestampUnixMS: time.Now().UnixMilli()})
 }
 
 func (s *Server) handleAuth(c *Connection, env protocol.Envelope) {
