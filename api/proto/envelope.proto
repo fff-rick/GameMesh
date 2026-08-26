@@ -1,0 +1,13 @@
+syntax = "proto3";
+package gamegateway.v1;
+option go_package = "game-gateway/api/proto;gatewayv1";
+message Envelope {
+  uint32 version = 1;
+  uint32 message_type = 2;
+  string request_id = 3;
+  string message_id = 4;
+  uint64 seq = 5;
+  uint64 ack = 6;
+  bytes payload = 7;
+  int64 timestamp_unix_ms = 8;
+}

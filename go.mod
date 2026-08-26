@@ -1,3 +1,3 @@
-module github.com/gamemesh-labs/gamemesh
+module game-gateway
 
 go 1.23
