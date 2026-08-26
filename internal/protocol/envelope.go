@@ -14,9 +14,13 @@ var (
 )
 
 const (
-	MessageTypeEchoRequest  uint32 = 1
-	MessageTypeEchoResponse uint32 = 2
-	BusinessMessageMin      uint32 = 1000
+	MessageTypeEchoRequest       uint32 = 1
+	MessageTypeEchoResponse      uint32 = 2
+	MessageTypeAuthRequest       uint32 = 10
+	MessageTypeAuthResult        uint32 = 11
+	MessageTypeHeartbeatRequest  uint32 = 12
+	MessageTypeHeartbeatResponse uint32 = 13
+	BusinessMessageMin           uint32 = 1000
 )
 
 type Envelope struct {
@@ -34,10 +38,19 @@ func (e Envelope) Validate() error {
 	if e.Version != CurrentVersion {
 		return fmt.Errorf("%w: got=%d want=%d", ErrUnsupportedVersion, e.Version, CurrentVersion)
 	}
-	if e.MessageType == 0 || (e.MessageType < BusinessMessageMin && e.MessageType != MessageTypeEchoRequest && e.MessageType != MessageTypeEchoResponse) {
+	if e.MessageType == 0 || (e.MessageType < BusinessMessageMin && !isKnownControlMessageType(e.MessageType)) {
 		return fmt.Errorf("%w: %d", ErrUnknownMessageType, e.MessageType)
 	}
 	return nil
+}
+
+func isKnownControlMessageType(mt uint32) bool {
+	switch mt {
+	case MessageTypeEchoRequest, MessageTypeEchoResponse, MessageTypeAuthRequest, MessageTypeAuthResult, MessageTypeHeartbeatRequest, MessageTypeHeartbeatResponse:
+		return true
+	default:
+		return false
+	}
 }
 
 func Marshal(e Envelope) []byte {

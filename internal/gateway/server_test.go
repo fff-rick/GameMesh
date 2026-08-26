@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"game-gateway/internal/auth"
 	"game-gateway/internal/config"
 	"game-gateway/internal/metrics"
 	"game-gateway/internal/protocol"
@@ -197,4 +199,239 @@ func TestSlowClientSendQueueIsBounded(t *testing.T) {
 	if c.SendQueueLen() > c.SendQueueCap() {
 		t.Fatalf("queue exceeded cap: %d>%d", c.SendQueueLen(), c.SendQueueCap())
 	}
+}
+
+type tokenAuthenticator map[string]string
+
+func (a tokenAuthenticator) Authenticate(_ context.Context, token string) (string, error) {
+	if userID, ok := a[token]; ok {
+		return userID, nil
+	}
+	return "", auth.ErrInvalidToken
+}
+
+func sendAuth(t *testing.T, c *ws.Conn, token string) protocol.AuthResult {
+	t.Helper()
+	req := protocol.Envelope{
+		Version:     protocol.CurrentVersion,
+		MessageType: protocol.MessageTypeAuthRequest,
+		RequestID:   "auth",
+		Payload:     protocol.MarshalAuthRequest(protocol.AuthRequest{Token: token}),
+	}
+	if err := c.WriteBinary(protocol.Marshal(req)); err != nil {
+		t.Fatal(err)
+	}
+	data, err := c.ReadBinary(64 * 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := protocol.Unmarshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.MessageType != protocol.MessageTypeAuthResult {
+		t.Fatalf("message_type=%d", env.MessageType)
+	}
+	result, err := protocol.UnmarshalAuthResult(env.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestAuthenticationCreatesSession(t *testing.T) {
+	cfg := config.Default()
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	c := dial(t, url)
+	defer c.Close()
+
+	result := sendAuth(t, c, "valid")
+	if !result.OK || result.UserID != "alice" || result.SessionID == "" {
+		t.Fatalf("result=%#v", result)
+	}
+	if gw.ActiveSessionCount() != 1 {
+		t.Fatalf("sessions=%d", gw.ActiveSessionCount())
+	}
+}
+
+func TestInvalidAndExpiredTokenDoNotCreateSession(t *testing.T) {
+	cfg := config.Default()
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	for _, token := range []string{"bad", "expired"} {
+		c := dial(t, url)
+		result := sendAuth(t, c, token)
+		if result.OK || result.ErrorCode != "invalid_token" {
+			t.Fatalf("token=%s result=%#v", token, result)
+		}
+		_ = c.Close()
+	}
+	if gw.ActiveSessionCount() != 0 {
+		t.Fatalf("sessions=%d", gw.ActiveSessionCount())
+	}
+}
+
+func TestUnauthenticatedBusinessMessageCannotCreateBusinessEffect(t *testing.T) {
+	cfg := config.Default()
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	c := dial(t, url)
+	defer c.Close()
+
+	business := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.BusinessMessageMin, RequestID: "business", Payload: []byte("must-not-run")}
+	if err := c.WriteBinary(protocol.Marshal(business)); err != nil {
+		t.Fatal(err)
+	}
+	result := sendAuth(t, c, "valid")
+	if !result.OK {
+		t.Fatalf("auth result=%#v", result)
+	}
+	if gw.UnauthenticatedBusinessRejected() != 1 {
+		t.Fatalf("rejected=%d", gw.UnauthenticatedBusinessRejected())
+	}
+}
+
+func TestDuplicateLoginNewLoginWins(t *testing.T) {
+	cfg := config.Default()
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"one": "alice", "two": "alice"}))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	oldConn := dial(t, url)
+	defer oldConn.Close()
+	oldResult := sendAuth(t, oldConn, "one")
+	if !oldResult.OK {
+		t.Fatalf("old=%#v", oldResult)
+	}
+
+	newConn := dial(t, url)
+	defer newConn.Close()
+	newResult := sendAuth(t, newConn, "two")
+	if !newResult.OK {
+		t.Fatalf("new=%#v", newResult)
+	}
+	if newResult.SessionID == oldResult.SessionID {
+		t.Fatal("new login reused old session")
+	}
+
+	if _, err := oldConn.ReadBinary(1024); err == nil {
+		t.Fatal("old connection should be closed by replacement")
+	}
+	if gw.ActiveSessionCount() != 1 {
+		t.Fatalf("sessions=%d", gw.ActiveSessionCount())
+	}
+}
+
+func sendHeartbeat(t *testing.T, c *ws.Conn) {
+	t.Helper()
+	req := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeHeartbeatRequest, RequestID: "hb", TimestampUnixMS: time.Now().UnixMilli()}
+	if err := c.WriteBinary(protocol.Marshal(req)); err != nil {
+		t.Fatal(err)
+	}
+	data, err := c.ReadBinary(64 * 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := protocol.Unmarshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.MessageType != protocol.MessageTypeHeartbeatResponse {
+		t.Fatalf("message_type=%d", env.MessageType)
+	}
+}
+
+func TestHeartbeatKeepsAuthenticatedConnectionAliveThenIdleTimeoutClosesIt(t *testing.T) {
+	cfg := config.Default()
+	cfg.IdleTimeout = 90 * time.Millisecond
+	cfg.HeartbeatCheckInterval = 10 * time.Millisecond
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	c := dial(t, url)
+	defer c.Close()
+	if result := sendAuth(t, c, "valid"); !result.OK {
+		t.Fatalf("auth=%#v", result)
+	}
+
+	for i := 0; i < 4; i++ {
+		time.Sleep(30 * time.Millisecond)
+		sendHeartbeat(t, c)
+	}
+	if gw.ConnectionCount() != 1 {
+		t.Fatalf("connection timed out despite heartbeat")
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool { return gw.ConnectionCount() == 0 })
+	if _, err := c.ReadBinary(1024); err == nil {
+		t.Fatal("idle connection should be closed")
+	}
+}
+
+func TestHalfOpenConnectionIsCollectedByIdleTimeout(t *testing.T) {
+	cfg := config.Default()
+	cfg.IdleTimeout = 40 * time.Millisecond
+	cfg.HeartbeatCheckInterval = 5 * time.Millisecond
+	gw := New(cfg, "test-gateway", testLogger())
+	defer gw.Close()
+
+	tr := newBlockingTransport()
+	c := newConnection("half-open", "test-gateway", tr, cfg.MaxEnvelopeBytes, cfg.SendQueueSize, cfg.WriteTimeout, testLogger(), gw.metrics, gw.handleEnvelope, gw.removeConn)
+	gw.mu.Lock()
+	gw.conns[c.ID()] = c
+	gw.mu.Unlock()
+	c.Start()
+	waitFor(t, 500*time.Millisecond, func() bool { return gw.ConnectionCount() == 0 })
+	c.Wait()
+}
+
+func TestCloseAndHeartbeatScanAreRaceSafe(t *testing.T) {
+	cfg := config.Default()
+	cfg.IdleTimeout = 20 * time.Millisecond
+	cfg.HeartbeatCheckInterval = 2 * time.Millisecond
+	gw := New(cfg, "test-gateway", testLogger())
+	tr := newBlockingTransport()
+	c := newConnection("race-close", "test-gateway", tr, cfg.MaxEnvelopeBytes, cfg.SendQueueSize, cfg.WriteTimeout, testLogger(), gw.metrics, gw.handleEnvelope, gw.removeConn)
+	gw.mu.Lock()
+	gw.conns[c.ID()] = c
+	gw.mu.Unlock()
+	c.Start()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); c.Close("concurrent_test") }()
+	}
+	wg.Wait()
+	gw.Close()
+	c.Wait()
+	if c.State() != ConnClosed {
+		t.Fatalf("state=%v", c.State())
+	}
+}
+
+func TestSessionEndsWhenAuthenticatedConnectionCloses(t *testing.T) {
+	cfg := config.Default()
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	c := dial(t, url)
+	if result := sendAuth(t, c, "valid"); !result.OK {
+		t.Fatalf("auth=%#v", result)
+	}
+	if gw.ActiveSessionCount() != 1 {
+		t.Fatalf("sessions=%d", gw.ActiveSessionCount())
+	}
+	_ = c.WriteClose()
+	_ = c.Close()
+	waitFor(t, time.Second, func() bool { return gw.ActiveSessionCount() == 0 && gw.ConnectionCount() == 0 })
 }

@@ -4,9 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"game-gateway/internal/auth"
 	"game-gateway/internal/config"
 	"game-gateway/internal/metrics"
 	"game-gateway/internal/protocol"
+	"game-gateway/internal/session"
 	"game-gateway/internal/ws"
 	"log/slog"
 	"net/http"
@@ -14,6 +16,16 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+type Option func(*Server)
+
+func WithAuthenticator(a auth.Authenticator) Option {
+	return func(s *Server) {
+		if a != nil {
+			s.authenticator = a
+		}
+	}
+}
 
 type Server struct {
 	cfg       config.Config
@@ -23,11 +35,35 @@ type Server struct {
 	mu        sync.RWMutex
 	conns     map[string]*Connection
 	closing   atomic.Bool
+
+	authenticator auth.Authenticator
+	sessions      *session.Manager
+	unauthRejects atomic.Uint64
+	heartbeatStop chan struct{}
+	heartbeatWG   sync.WaitGroup
 }
 
-func New(cfg config.Config, gatewayID string, logger *slog.Logger) *Server {
-	return &Server{cfg: cfg, gatewayID: gatewayID, logger: logger.With("gateway_id", gatewayID), metrics: metrics.New(gatewayID), conns: make(map[string]*Connection)}
+func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Option) *Server {
+	s := &Server{
+		cfg:           cfg,
+		gatewayID:     gatewayID,
+		logger:        logger.With("gateway_id", gatewayID),
+		metrics:       metrics.New(gatewayID),
+		conns:         make(map[string]*Connection),
+		authenticator: auth.DevAuthenticator{},
+		sessions:      session.NewManager(),
+		heartbeatStop: make(chan struct{}),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.cfg.HeartbeatCheckInterval > 0 && s.cfg.IdleTimeout > 0 {
+		s.heartbeatWG.Add(1)
+		go s.heartbeatLoop()
+	}
+	return s
 }
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWS)
@@ -41,11 +77,21 @@ func (s *Server) Handler() http.Handler {
 	})
 	return mux
 }
-func (s *Server) ConnectionCount() int { s.mu.RLock(); defer s.mu.RUnlock(); return len(s.conns) }
+
+func (s *Server) ConnectionCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.conns)
+}
+func (s *Server) ActiveSessionCount() int                 { return s.sessions.ActiveCount() }
+func (s *Server) UnauthenticatedBusinessRejected() uint64 { return s.unauthRejects.Load() }
+
 func (s *Server) Close() {
 	if !s.closing.CompareAndSwap(false, true) {
 		return
 	}
+	close(s.heartbeatStop)
+	s.heartbeatWG.Wait()
 	s.mu.RLock()
 	list := make([]*Connection, 0, len(s.conns))
 	for _, c := range s.conns {
@@ -59,6 +105,7 @@ func (s *Server) Close() {
 		c.Wait()
 	}
 }
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if s.closing.Load() {
 		http.Error(w, "gateway shutting down", http.StatusServiceUnavailable)
@@ -83,16 +130,129 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	c.Start()
 }
-func (s *Server) removeConn(c *Connection) { s.mu.Lock(); delete(s.conns, c.ID()); s.mu.Unlock() }
+
+func (s *Server) removeConn(c *Connection) {
+	if ended := s.sessions.TerminateByConn(c.ID()); ended != nil {
+		s.metrics.SetActiveSessions(s.sessions.ActiveCount())
+		s.logger.Info("session terminated", "session_id", ended.ID, "user_id", ended.UserID, "conn_id", ended.ConnID)
+	}
+	s.mu.Lock()
+	delete(s.conns, c.ID())
+	s.mu.Unlock()
+}
+
 func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
+	if env.MessageType == protocol.MessageTypeAuthRequest {
+		s.handleAuth(c, env)
+		return
+	}
+	if env.MessageType == protocol.MessageTypeHeartbeatRequest {
+		if c.Authenticated() {
+			resp := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeHeartbeatResponse, RequestID: env.RequestID, TimestampUnixMS: time.Now().UnixMilli()}
+			s.enqueueOrClose(c, resp)
+		}
+		return
+	}
+	if env.MessageType >= protocol.BusinessMessageMin && !c.Authenticated() {
+		s.unauthRejects.Add(1)
+		c.logger.Warn("unauthenticated business message rejected", "message_type", env.MessageType, "request_id", env.RequestID)
+		return
+	}
 	if env.MessageType != protocol.MessageTypeEchoRequest {
 		return
 	}
 	resp := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeEchoResponse, RequestID: env.RequestID, Payload: env.Payload, TimestampUnixMS: time.Now().UnixMilli()}
-	if err := c.Enqueue(protocol.Marshal(resp)); err != nil && errors.Is(err, ErrSendQueueFull) {
+	s.enqueueOrClose(c, resp)
+}
+
+func (s *Server) handleAuth(c *Connection, env protocol.Envelope) {
+	if c.Authenticated() {
+		s.metrics.AuthResult("already_authenticated")
+		s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: false, ErrorCode: "already_authenticated"})
+		return
+	}
+	req, err := protocol.UnmarshalAuthRequest(env.Payload)
+	if err != nil {
+		s.metrics.AuthResult("invalid_auth_payload")
+		s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: false, ErrorCode: "invalid_auth_payload"})
+		return
+	}
+	userID, err := s.authenticator.Authenticate(c.ctx, req.Token)
+	if err != nil || userID == "" {
+		s.metrics.AuthResult("invalid_token")
+		s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: false, ErrorCode: "invalid_token"})
+		return
+	}
+	current, replaced, err := s.sessions.Register(userID, c.ID())
+	if err != nil {
+		s.metrics.AuthResult("session_create_failed")
+		s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: false, ErrorCode: "session_create_failed"})
+		return
+	}
+	c.bindIdentity(userID, current.ID)
+	s.metrics.SetActiveSessions(s.sessions.ActiveCount())
+	s.metrics.AuthResult("success")
+	s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: true, UserID: userID, SessionID: current.ID})
+	if replaced != nil {
+		if old := s.connectionByID(replaced.ConnID); old != nil && old.ID() != c.ID() {
+			old.Close("duplicate_login_replaced")
+		}
+	}
+}
+
+func (s *Server) sendAuthResult(c *Connection, requestID string, result protocol.AuthResult) {
+	resp := protocol.Envelope{
+		Version:         protocol.CurrentVersion,
+		MessageType:     protocol.MessageTypeAuthResult,
+		RequestID:       requestID,
+		Payload:         protocol.MarshalAuthResult(result),
+		TimestampUnixMS: time.Now().UnixMilli(),
+	}
+	s.enqueueOrClose(c, resp)
+}
+
+func (s *Server) enqueueOrClose(c *Connection, env protocol.Envelope) {
+	if err := c.Enqueue(protocol.Marshal(env)); err != nil && errors.Is(err, ErrSendQueueFull) {
 		c.Close("send_queue_full")
 	}
 }
+
+func (s *Server) connectionByID(id string) *Connection {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.conns[id]
+}
+
+func (s *Server) heartbeatLoop() {
+	defer s.heartbeatWG.Done()
+	ticker := time.NewTicker(s.cfg.HeartbeatCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.heartbeatStop:
+			return
+		case now := <-ticker.C:
+			s.closeIdleConnections(now)
+		}
+	}
+}
+
+func (s *Server) closeIdleConnections(now time.Time) {
+	s.mu.RLock()
+	list := make([]*Connection, 0, len(s.conns))
+	for _, c := range s.conns {
+		list = append(list, c)
+	}
+	s.mu.RUnlock()
+	for _, c := range list {
+		if c.State() == ConnOpen && now.Sub(c.LastSeen()) > s.cfg.IdleTimeout {
+			if c.Close("heartbeat_timeout") {
+				s.metrics.HeartbeatTimeout()
+			}
+		}
+	}
+}
+
 func newID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

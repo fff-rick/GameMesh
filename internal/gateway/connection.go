@@ -42,16 +42,21 @@ type Connection struct {
 	onEnvelope       func(*Connection, protocol.Envelope)
 	onClosed         func(*Connection)
 	state            atomic.Uint32
+	lastSeenUnixNano atomic.Int64
 	ctx              context.Context
 	cancel           context.CancelFunc
 	closeOnce        sync.Once
 	wg               sync.WaitGroup
+	identityMu       sync.RWMutex
+	userID           string
+	sessionID        string
 }
 
 func newConnection(id, gatewayID string, tr transport, maxBytes int64, queueSize int, writeTimeout time.Duration, logger *slog.Logger, m *metrics.Metrics, onEnvelope func(*Connection, protocol.Envelope), onClosed func(*Connection)) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Connection{id: id, gatewayID: gatewayID, transport: tr, maxEnvelopeBytes: maxBytes, writeTimeout: writeTimeout, sendQ: make(chan []byte, queueSize), logger: logger.With("conn_id", id), metrics: m, onEnvelope: onEnvelope, onClosed: onClosed, ctx: ctx, cancel: cancel}
 	c.state.Store(uint32(ConnNew))
+	c.lastSeenUnixNano.Store(time.Now().UnixNano())
 	c.wg.Add(2)
 	return c
 }
@@ -59,6 +64,31 @@ func (c *Connection) ID() string        { return c.id }
 func (c *Connection) State() ConnState  { return ConnState(c.state.Load()) }
 func (c *Connection) SendQueueLen() int { return len(c.sendQ) }
 func (c *Connection) SendQueueCap() int { return cap(c.sendQ) }
+func (c *Connection) Authenticated() bool {
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	return c.sessionID != ""
+}
+func (c *Connection) UserID() string {
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	return c.userID
+}
+func (c *Connection) SessionID() string {
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	return c.sessionID
+}
+func (c *Connection) LastSeen() time.Time {
+	return time.Unix(0, c.lastSeenUnixNano.Load())
+}
+func (c *Connection) touch() { c.lastSeenUnixNano.Store(time.Now().UnixNano()) }
+func (c *Connection) bindIdentity(userID, sessionID string) {
+	c.identityMu.Lock()
+	c.userID = userID
+	c.sessionID = sessionID
+	c.identityMu.Unlock()
+}
 func (c *Connection) Start() {
 	if !c.state.CompareAndSwap(uint32(ConnNew), uint32(ConnOpen)) {
 		return
@@ -81,8 +111,10 @@ func (c *Connection) Enqueue(data []byte) error {
 		return ErrSendQueueFull
 	}
 }
-func (c *Connection) Close(reason string) {
+func (c *Connection) Close(reason string) bool {
+	closed := false
 	c.closeOnce.Do(func() {
+		closed = true
 		wasOpen := c.state.Swap(uint32(ConnClosing)) == uint32(ConnOpen)
 		c.cancel()
 		_ = c.transport.Close()
@@ -95,6 +127,7 @@ func (c *Connection) Close(reason string) {
 			c.onClosed(c)
 		}
 	})
+	return closed
 }
 func (c *Connection) Wait() { c.wg.Wait() }
 func (c *Connection) readLoop() {
@@ -115,6 +148,7 @@ func (c *Connection) readLoop() {
 			c.logger.Warn("rejected envelope", "error", err)
 			continue
 		}
+		c.touch()
 		if c.onEnvelope != nil {
 			c.onEnvelope(c, env)
 		}
