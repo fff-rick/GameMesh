@@ -1,6 +1,18 @@
 syntax = "proto3";
 package gamegateway.v1;
 option go_package = "game-gateway/api/proto;gatewayv1";
+
+// Numeric values are frozen by the Stage 2 protocol contract.
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  MESSAGE_TYPE_ECHO_REQUEST = 1;
+  MESSAGE_TYPE_ECHO_RESPONSE = 2;
+  MESSAGE_TYPE_AUTH_REQUEST = 10;
+  MESSAGE_TYPE_AUTH_RESULT = 11;
+  MESSAGE_TYPE_HEARTBEAT_REQUEST = 12;
+  MESSAGE_TYPE_HEARTBEAT_RESPONSE = 13;
+}
+
 message Envelope {
   uint32 version = 1;
   uint32 message_type = 2;
@@ -10,4 +22,15 @@ message Envelope {
   uint64 ack = 6;
   bytes payload = 7;
   int64 timestamp_unix_ms = 8;
+}
+
+message AuthRequest {
+  string token = 1;
+}
+
+message AuthResult {
+  bool ok = 1;
+  string user_id = 2;
+  string session_id = 3;
+  string error_code = 4;
 }
