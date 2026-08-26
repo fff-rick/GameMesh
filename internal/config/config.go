@@ -14,6 +14,7 @@ type Config struct {
 	WriteTimeout           time.Duration
 	HeartbeatCheckInterval time.Duration
 	IdleTimeout            time.Duration
+	BackendRPCTimeout      time.Duration
 }
 
 func Default() Config {
@@ -24,5 +25,6 @@ func Default() Config {
 		WriteTimeout:           5 * time.Second,
 		HeartbeatCheckInterval: 15 * time.Second,
 		IdleTimeout:            45 * time.Second,
+		BackendRPCTimeout:      500 * time.Millisecond,
 	}
 }

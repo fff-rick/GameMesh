@@ -1,0 +1,24 @@
+syntax = "proto3";
+package gamegateway.backend.v1;
+option go_package = "game-gateway/api/proto;gatewayv1";
+
+// Stage 3 internal contract. Implementations use grpc-go when the dependency is available.
+service BackendService {
+  rpc Handle(BackendRequest) returns (BackendResponse);
+}
+
+message BackendRequest {
+  string user_id = 1;
+  string session_id = 2;
+  string room_id = 3;
+  uint32 message_type = 4;
+  string request_id = 5;
+  bytes payload = 6;
+  int64 timestamp_unix_ms = 7;
+}
+
+message BackendResponse {
+  uint32 message_type = 1;
+  bytes payload = 2;
+  string error_code = 3;
+}

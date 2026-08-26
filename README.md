@@ -1,35 +1,38 @@
 # Game Gateway
 
-当前完成版本：**Stage 2 — 鉴权、Session 与心跳**。
+当前完成版本：**Stage 3 — Backend 路由（核心行为完成；真实 grpc-go transport 受离线环境限制）**。
 
-项目严格按 `docs/03-阶段性任务.md` 顺序开发：Stage 0、Stage 1、Stage 2 已验收，尚未进入 Stage 3。
+项目严格按 `docs/03-阶段性任务.md` 顺序开发：Stage 0、Stage 1、Stage 2 已验收；Stage 3 的路由、timeout、错误映射、并发与 Metrics 已完成，真实 grpc-go transport 尚需在可获取依赖的环境中补验。
 
 ## 目录
 
 ```text
-game-gateway-stage2/
+game-gateway-stage3/
 ├── api/proto/envelope.proto
 ├── cmd/
 │   ├── gateway/
 │   └── bench/
 ├── internal/
 │   ├── auth/          # Authentication Hook + 本地开发鉴权器
+│   ├── backend/       # BackendClient、timeout/error mapping、Protobuf wire
 │   ├── config/
 │   ├── gateway/       # Connection + Server + auth/heartbeat orchestration
 │   ├── metrics/
-│   ├── protocol/      # Envelope + Stage 2 control payload wire codec
+│   ├── protocol/      # Envelope + control/error payload wire codec
+│   ├── routing/       # MessageType/User/Room/BackendInstance 静态路由
 │   ├── session/       # 并发安全 Session Manager
 │   └── ws/
 └── docs/
     ├── stage-0/
     ├── stage-1/
     ├── stage-2/
+    ├── stage-3/
     └── superpowers/plans/
 ```
 
 ## 构建与测试
 
-项目仍无第三方 Go module 依赖，可离线构建：
+当前默认构建仍无第三方 Go module 依赖，可离线验证 Stage 3 核心行为：
 
 ```bash
 go test ./...
@@ -79,3 +82,10 @@ Stage 2 冻结策略为 **New Login Wins**：同账号新登录成功后，旧 S
 ## 下一阶段
 
 Stage 3 才加入 gRPC 内部接口、MessageType -> Backend 路由、User -> Room、Room -> BackendInstance、RPC timeout 和基础快速失败策略。
+
+
+## Stage 3 — Backend Routing
+
+Stage 3 adds static MessageType/User/Room/BackendInstance routing, a transport-neutral BackendClient contract, strict backend timeouts, controlled error mapping, and backend RPC metrics. The gRPC service contract is frozen in `api/proto/backend.proto`.
+
+**Environment note:** this execution environment cannot download `google.golang.org/grpc`, so the real grpc-go transport adapter and independent-process gRPC Fake Backend are not compiled here. See `docs/stage-3/00-阶段3验收报告.md`.

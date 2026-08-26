@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"game-gateway/internal/auth"
+	"game-gateway/internal/backend"
 	"game-gateway/internal/config"
 	"game-gateway/internal/metrics"
 	"game-gateway/internal/protocol"
+	"game-gateway/internal/routing"
 	"game-gateway/internal/ws"
 )
 
@@ -434,4 +436,144 @@ func TestSessionEndsWhenAuthenticatedConnectionCloses(t *testing.T) {
 	_ = c.WriteClose()
 	_ = c.Close()
 	waitFor(t, time.Second, func() bool { return gw.ActiveSessionCount() == 0 && gw.ConnectionCount() == 0 })
+}
+
+type fakeBackendClient struct {
+	handle func(context.Context, backend.Request) (backend.Response, error)
+}
+
+func (f fakeBackendClient) Handle(ctx context.Context, req backend.Request) (backend.Response, error) {
+	return f.handle(ctx, req)
+}
+
+func readEnvelope(t *testing.T, c *ws.Conn) protocol.Envelope {
+	t.Helper()
+	data, err := c.ReadBinary(64 * 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := protocol.Unmarshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+func setupRoutedServer(t *testing.T, client backend.Client) (*Server, *ws.Conn, *routing.StaticRouter, *backend.Registry) {
+	t.Helper()
+	cfg := config.Default()
+	cfg.BackendRPCTimeout = 40 * time.Millisecond
+	r := routing.NewStaticRouter()
+	r.SetMessageBackend(1001, "room")
+	r.SetUserRoom("alice", "room-1")
+	r.SetRoomInstance("room-1", routing.BackendInstance{ID: "room-a", BackendType: "room", Address: "inproc"})
+	reg := backend.NewRegistry()
+	if client != nil {
+		reg.Set("room-a", client)
+	}
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}), WithRouter(r), WithBackendRegistry(reg))
+	ts := httptest.NewServer(gw.Handler())
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	c := dial(t, url)
+	if result := sendAuth(t, c, "valid"); !result.OK {
+		t.Fatalf("auth=%#v", result)
+	}
+	t.Cleanup(func() { _ = c.Close(); gw.Close(); ts.Close() })
+	return gw, c, r, reg
+}
+
+func sendBusiness(t *testing.T, c *ws.Conn, mt uint32, id string, payload []byte) protocol.Envelope {
+	t.Helper()
+	req := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: mt, RequestID: id, Payload: payload, TimestampUnixMS: time.Now().UnixMilli()}
+	if err := c.WriteBinary(protocol.Marshal(req)); err != nil {
+		t.Fatal(err)
+	}
+	return readEnvelope(t, c)
+}
+
+func TestAuthenticatedBusinessMessageRoutesToBackend(t *testing.T) {
+	var got backend.Request
+	_, c, _, _ := setupRoutedServer(t, fakeBackendClient{handle: func(_ context.Context, req backend.Request) (backend.Response, error) {
+		got = req
+		return backend.Response{MessageType: 1002, Payload: []byte("backend-ok")}, nil
+	}})
+	env := sendBusiness(t, c, 1001, "req-1", []byte("move"))
+	if env.MessageType != 1002 || env.RequestID != "req-1" || string(env.Payload) != "backend-ok" {
+		t.Fatalf("env=%#v", env)
+	}
+	if got.UserID != "alice" || got.RoomID != "room-1" || got.MessageType != 1001 || string(got.Payload) != "move" {
+		t.Fatalf("req=%#v", got)
+	}
+}
+
+func TestUnknownBusinessMessageReturnsRoutingError(t *testing.T) {
+	gw, c, _, _ := setupRoutedServer(t, fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		t.Fatal("backend must not be called")
+		return backend.Response{}, nil
+	}})
+	env := sendBusiness(t, c, 1999, "unknown", nil)
+	if env.MessageType != protocol.MessageTypeError {
+		t.Fatalf("type=%d", env.MessageType)
+	}
+	er, err := protocol.UnmarshalErrorResponse(env.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if er.ErrorCode != "routing_unknown_message_type" || er.Retryable {
+		t.Fatalf("error=%#v", er)
+	}
+	if gw.ActiveSessionCount() != 1 {
+		t.Fatalf("sessions=%d", gw.ActiveSessionCount())
+	}
+}
+
+func TestBackendTimeoutReturnsControlledErrorAndKeepsSession(t *testing.T) {
+	gw, c, _, _ := setupRoutedServer(t, fakeBackendClient{handle: func(ctx context.Context, _ backend.Request) (backend.Response, error) {
+		<-ctx.Done()
+		return backend.Response{}, ctx.Err()
+	}})
+	env := sendBusiness(t, c, 1001, "timeout", nil)
+	er, err := protocol.UnmarshalErrorResponse(env.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.MessageType != protocol.MessageTypeError || er.ErrorCode != "backend_timeout" || !er.Retryable {
+		t.Fatalf("env=%#v err=%#v", env, er)
+	}
+	if gw.ActiveSessionCount() != 1 {
+		t.Fatalf("sessions=%d", gw.ActiveSessionCount())
+	}
+}
+
+func TestBackendUnavailableAndBackendDeclaredErrorAreMapped(t *testing.T) {
+	t.Run("unavailable", func(t *testing.T) {
+		gw, c, _, _ := setupRoutedServer(t, nil)
+		env := sendBusiness(t, c, 1001, "unavailable", nil)
+		er, err := protocol.UnmarshalErrorResponse(env.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if er.ErrorCode != "backend_unavailable" || !er.Retryable {
+			t.Fatalf("error=%#v", er)
+		}
+		if gw.ActiveSessionCount() != 1 {
+			t.Fatalf("sessions=%d", gw.ActiveSessionCount())
+		}
+	})
+	t.Run("backend error", func(t *testing.T) {
+		gw, c, _, _ := setupRoutedServer(t, fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+			return backend.Response{ErrorCode: "room_full"}, nil
+		}})
+		env := sendBusiness(t, c, 1001, "business-error", nil)
+		er, err := protocol.UnmarshalErrorResponse(env.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if er.ErrorCode != "room_full" || er.Retryable {
+			t.Fatalf("error=%#v", er)
+		}
+		if gw.ActiveSessionCount() != 1 {
+			t.Fatalf("sessions=%d", gw.ActiveSessionCount())
+		}
+	})
 }
