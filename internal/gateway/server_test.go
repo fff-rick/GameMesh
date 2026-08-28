@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"game-gateway/internal/config"
 	"game-gateway/internal/metrics"
 	"game-gateway/internal/protocol"
+	"game-gateway/internal/reliability"
 	"game-gateway/internal/routing"
 	"game-gateway/internal/ws"
 )
@@ -576,4 +578,162 @@ func TestBackendUnavailableAndBackendDeclaredErrorAreMapped(t *testing.T) {
 			t.Fatalf("sessions=%d", gw.ActiveSessionCount())
 		}
 	})
+}
+
+func setupReliableRoutedServer(t *testing.T, cfg config.Config, classifier reliability.Classifier, client backend.Client) (*Server, *ws.Conn) {
+	t.Helper()
+	r := routing.NewStaticRouter()
+	r.SetMessageBackend(1001, "room")
+	r.SetUserRoom("alice", "room-1")
+	r.SetRoomInstance("room-1", routing.BackendInstance{ID: "room-a", BackendType: "room", Address: "inproc"})
+	reg := backend.NewRegistry()
+	reg.Set("room-a", client)
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}), WithRouter(r), WithBackendRegistry(reg), WithReliabilityClassifier(classifier))
+	ts := httptest.NewServer(gw.Handler())
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	c := dial(t, url)
+	if result := sendAuth(t, c, "valid"); !result.OK {
+		t.Fatalf("auth=%#v", result)
+	}
+	t.Cleanup(func() { _ = c.Close(); gw.Close(); ts.Close() })
+	return gw, c
+}
+
+func writeEnvelope(t *testing.T, c *ws.Conn, env protocol.Envelope) {
+	t.Helper()
+	if err := c.WriteBinary(protocol.Marshal(env)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReliableInboundDuplicateDoesNotRepeatBackendEffect(t *testing.T) {
+	cfg := config.Default()
+	classifier := reliability.NewStaticClassifier(1001)
+	var calls atomic.Int64
+	gw, c := setupReliableRoutedServer(t, cfg, classifier, fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		calls.Add(1)
+		return backend.Response{MessageType: 1002, Payload: []byte("ok")}, nil
+	}})
+	_ = gw
+	req := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: 1001, RequestID: "r1", MessageID: "m1", Seq: 1, Payload: []byte("effect")}
+	writeEnvelope(t, c, req)
+	ack := readEnvelope(t, c)
+	if ack.MessageType != protocol.MessageTypeAck || ack.Ack != 1 {
+		t.Fatalf("ack=%#v", ack)
+	}
+	resp := readEnvelope(t, c)
+	if resp.MessageType != 1002 {
+		t.Fatalf("resp=%#v", resp)
+	}
+	writeEnvelope(t, c, req)
+	ack = readEnvelope(t, c)
+	if ack.MessageType != protocol.MessageTypeAck || ack.Ack != 1 {
+		t.Fatalf("duplicate ack=%#v", ack)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("backend calls=%d", got)
+	}
+}
+
+func TestReliableInboundOutOfOrderIsRejectedBeforeBackend(t *testing.T) {
+	cfg := config.Default()
+	classifier := reliability.NewStaticClassifier(1001)
+	var calls atomic.Int64
+	_, c := setupReliableRoutedServer(t, cfg, classifier, fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		calls.Add(1)
+		return backend.Response{MessageType: 1002}, nil
+	}})
+	writeEnvelope(t, c, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "r2", MessageID: "m2", Seq: 2})
+	env := readEnvelope(t, c)
+	if env.MessageType != protocol.MessageTypeError {
+		t.Fatalf("env=%#v", env)
+	}
+	er, err := protocol.UnmarshalErrorResponse(env.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if er.ErrorCode != "reliable_out_of_order" || !er.Retryable {
+		t.Fatalf("error=%#v", er)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("backend calls=%d", got)
+	}
+}
+
+func TestReliableOutboundRetriesAfterDroppedAckAndStopsAfterDelayedAck(t *testing.T) {
+	cfg := config.Default()
+	cfg.ReliableRetryInterval = 20 * time.Millisecond
+	cfg.ReliableMaxRetries = 3
+	classifier := reliability.NewStaticClassifier(1002)
+	gw, c := setupReliableRoutedServer(t, cfg, classifier, fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		return backend.Response{MessageType: 1002, Payload: []byte("reliable")}, nil
+	}})
+	writeEnvelope(t, c, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "r", Payload: []byte("x")})
+	first := readEnvelope(t, c)
+	if first.MessageType != 1002 || first.Seq != 1 || first.MessageID == "" {
+		t.Fatalf("first=%#v", first)
+	}
+	retry := readEnvelope(t, c)
+	if retry.Seq != first.Seq || retry.MessageID != first.MessageID || string(retry.Payload) != string(first.Payload) {
+		t.Fatalf("retry=%#v first=%#v", retry, first)
+	}
+	writeEnvelope(t, c, protocol.Envelope{Version: 1, MessageType: protocol.MessageTypeAck, Ack: first.Seq})
+	waitFor(t, 250*time.Millisecond, func() bool { return gw.ReliablePendingCount() == 0 })
+	time.Sleep(60 * time.Millisecond)
+	if got := gw.ReliablePendingCount(); got != 0 {
+		t.Fatalf("pending=%d", got)
+	}
+}
+
+func TestConnectionCloseBeforeAckClearsReliablePending(t *testing.T) {
+	cfg := config.Default()
+	cfg.ReliableRetryInterval = 100 * time.Millisecond
+	classifier := reliability.NewStaticClassifier(1002)
+	gw, c := setupReliableRoutedServer(t, cfg, classifier, fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		return backend.Response{MessageType: 1002}, nil
+	}})
+	writeEnvelope(t, c, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "r"})
+	resp := readEnvelope(t, c)
+	if resp.Seq == 0 {
+		t.Fatalf("resp=%#v", resp)
+	}
+	waitFor(t, time.Second, func() bool { return gw.ReliablePendingCount() == 1 })
+	_ = c.WriteClose()
+	_ = c.Close()
+	waitFor(t, time.Second, func() bool { return gw.ReliablePendingCount() == 0 && gw.ActiveSessionCount() == 0 })
+}
+
+func TestReliablePendingOverflowClosesConnection(t *testing.T) {
+	cfg := config.Default()
+	cfg.ReliablePendingLimit = 1
+	cfg.ReliableRetryInterval = time.Second
+	classifier := reliability.NewStaticClassifier(1002)
+	gw, c := setupReliableRoutedServer(t, cfg, classifier, fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		return backend.Response{MessageType: 1002}, nil
+	}})
+	writeEnvelope(t, c, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "r1"})
+	_ = readEnvelope(t, c)
+	writeEnvelope(t, c, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "r2"})
+	waitFor(t, time.Second, func() bool { return gw.ConnectionCount() == 0 })
+}
+
+func TestReliableOutboundStopsAfterMaxRetries(t *testing.T) {
+	cfg := config.Default()
+	cfg.ReliableRetryInterval = 10 * time.Millisecond
+	cfg.ReliableMaxRetries = 1
+	classifier := reliability.NewStaticClassifier(1002)
+	gw, c := setupReliableRoutedServer(t, cfg, classifier, fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		return backend.Response{MessageType: 1002, Payload: []byte("must-ack")}, nil
+	}})
+	writeEnvelope(t, c, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "r"})
+	first := readEnvelope(t, c)
+	if first.Seq != 1 {
+		t.Fatalf("first=%#v", first)
+	}
+	retry := readEnvelope(t, c)
+	if retry.Seq != first.Seq || retry.MessageID != first.MessageID {
+		t.Fatalf("retry=%#v", retry)
+	}
+	waitFor(t, 500*time.Millisecond, func() bool { return gw.ConnectionCount() == 0 && gw.ReliablePendingCount() == 0 })
 }
