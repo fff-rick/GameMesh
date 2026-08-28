@@ -11,21 +11,27 @@ import (
 )
 
 type Metrics struct {
-	gatewayID         string
-	connections       atomic.Int64
-	connectionsTotal  atomic.Uint64
-	messagesReceived  atomic.Uint64
-	messagesSent      atomic.Uint64
-	bytesReceived     atomic.Uint64
-	bytesSent         atomic.Uint64
-	queueDepthMax     atomic.Int64
-	activeSessions    atomic.Int64
-	heartbeatTimeouts atomic.Uint64
-	mu                sync.Mutex
-	disconnects       map[string]uint64
-	authResults       map[string]uint64
-	backendRPCResults map[string]uint64
-	backendRPCLatency map[string]latencyAgg
+	gatewayID               string
+	connections             atomic.Int64
+	connectionsTotal        atomic.Uint64
+	messagesReceived        atomic.Uint64
+	messagesSent            atomic.Uint64
+	bytesReceived           atomic.Uint64
+	bytesSent               atomic.Uint64
+	queueDepthMax           atomic.Int64
+	activeSessions          atomic.Int64
+	heartbeatTimeouts       atomic.Uint64
+	reliablePending         atomic.Int64
+	reliableRetries         atomic.Uint64
+	reliableDedup           atomic.Uint64
+	reliableOutOfOrder      atomic.Uint64
+	reliableRetryExhausted  atomic.Uint64
+	reliablePendingOverflow atomic.Uint64
+	mu                      sync.Mutex
+	disconnects             map[string]uint64
+	authResults             map[string]uint64
+	backendRPCResults       map[string]uint64
+	backendRPCLatency       map[string]latencyAgg
 }
 
 func New(gatewayID string) *Metrics {
@@ -38,10 +44,16 @@ func (m *Metrics) ConnectionClosed(reason string) {
 	m.disconnects[reason]++
 	m.mu.Unlock()
 }
-func (m *Metrics) Received(n int)          { m.messagesReceived.Add(1); m.bytesReceived.Add(uint64(n)) }
-func (m *Metrics) Sent(n int)              { m.messagesSent.Add(1); m.bytesSent.Add(uint64(n)) }
-func (m *Metrics) SetActiveSessions(n int) { m.activeSessions.Store(int64(n)) }
-func (m *Metrics) HeartbeatTimeout()       { m.heartbeatTimeouts.Add(1) }
+func (m *Metrics) Received(n int)           { m.messagesReceived.Add(1); m.bytesReceived.Add(uint64(n)) }
+func (m *Metrics) Sent(n int)               { m.messagesSent.Add(1); m.bytesSent.Add(uint64(n)) }
+func (m *Metrics) SetActiveSessions(n int)  { m.activeSessions.Store(int64(n)) }
+func (m *Metrics) HeartbeatTimeout()        { m.heartbeatTimeouts.Add(1) }
+func (m *Metrics) SetReliablePending(n int) { m.reliablePending.Store(int64(n)) }
+func (m *Metrics) ReliableRetry()           { m.reliableRetries.Add(1) }
+func (m *Metrics) ReliableDedup()           { m.reliableDedup.Add(1) }
+func (m *Metrics) ReliableOutOfOrder()      { m.reliableOutOfOrder.Add(1) }
+func (m *Metrics) ReliableRetryExhausted()  { m.reliableRetryExhausted.Add(1) }
+func (m *Metrics) ReliablePendingOverflow() { m.reliablePendingOverflow.Add(1) }
 func (m *Metrics) AuthResult(result string) {
 	m.mu.Lock()
 	m.authResults[result]++
@@ -88,6 +100,12 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 	fmt.Fprintf(w, "game_gateway_send_queue_depth_max{gateway_id=\"%s\"} %d\n", gid, m.queueDepthMax.Load())
 	fmt.Fprintf(w, "# TYPE game_gateway_sessions gauge\ngame_gateway_sessions{gateway_id=\"%s\",state=\"active\"} %d\n", gid, m.activeSessions.Load())
 	fmt.Fprintf(w, "# TYPE game_gateway_heartbeat_timeouts_total counter\ngame_gateway_heartbeat_timeouts_total{gateway_id=\"%s\"} %d\n", gid, m.heartbeatTimeouts.Load())
+	fmt.Fprintf(w, "# TYPE game_gateway_reliable_pending gauge\ngame_gateway_reliable_pending{gateway_id=\"%s\"} %d\n", gid, m.reliablePending.Load())
+	fmt.Fprintf(w, "# TYPE game_gateway_reliable_retries_total counter\ngame_gateway_reliable_retries_total{gateway_id=\"%s\"} %d\n", gid, m.reliableRetries.Load())
+	fmt.Fprintf(w, "# TYPE game_gateway_reliable_dedup_total counter\ngame_gateway_reliable_dedup_total{gateway_id=\"%s\"} %d\n", gid, m.reliableDedup.Load())
+	fmt.Fprintf(w, "# TYPE game_gateway_reliable_out_of_order_total counter\ngame_gateway_reliable_out_of_order_total{gateway_id=\"%s\"} %d\n", gid, m.reliableOutOfOrder.Load())
+	fmt.Fprintf(w, "# TYPE game_gateway_reliable_retry_exhausted_total counter\ngame_gateway_reliable_retry_exhausted_total{gateway_id=\"%s\"} %d\n", gid, m.reliableRetryExhausted.Load())
+	fmt.Fprintf(w, "# TYPE game_gateway_reliable_pending_overflow_total counter\ngame_gateway_reliable_pending_overflow_total{gateway_id=\"%s\"} %d\n", gid, m.reliablePendingOverflow.Load())
 	m.mu.Lock()
 	keys := make([]string, 0, len(m.disconnects))
 	for k := range m.disconnects {

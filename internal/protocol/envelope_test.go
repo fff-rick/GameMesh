@@ -29,3 +29,9 @@ func TestEnvelopeVersionAndMessageType(t *testing.T) {
 		t.Fatal("expected message type error")
 	}
 }
+
+func TestAckIsKnownControlMessageType(t *testing.T) {
+	if err := (Envelope{Version: CurrentVersion, MessageType: MessageTypeAck, Ack: 9}).Validate(); err != nil {
+		t.Fatalf("ack validate: %v", err)
+	}
+}

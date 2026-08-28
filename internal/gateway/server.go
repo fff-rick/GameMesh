@@ -9,6 +9,7 @@ import (
 	"game-gateway/internal/config"
 	"game-gateway/internal/metrics"
 	"game-gateway/internal/protocol"
+	"game-gateway/internal/reliability"
 	"game-gateway/internal/routing"
 	"game-gateway/internal/session"
 	"game-gateway/internal/ws"
@@ -45,6 +46,14 @@ func WithBackendRegistry(r *backend.Registry) Option {
 	}
 }
 
+func WithReliabilityClassifier(c reliability.Classifier) Option {
+	return func(s *Server) {
+		if c != nil {
+			s.reliabilityClassifier = c
+		}
+	}
+}
+
 type Server struct {
 	cfg       config.Config
 	gatewayID string
@@ -62,21 +71,31 @@ type Server struct {
 	router        routing.Resolver
 	backends      *backend.Registry
 	backendCaller *backend.Caller
+
+	reliabilityClassifier reliability.Classifier
+	reliability           *reliability.Manager
+	reliableStop          chan struct{}
+	reliableWG            sync.WaitGroup
 }
 
 func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Option) *Server {
 	s := &Server{
-		cfg:           cfg,
-		gatewayID:     gatewayID,
-		logger:        logger.With("gateway_id", gatewayID),
-		metrics:       metrics.New(gatewayID),
-		conns:         make(map[string]*Connection),
-		authenticator: auth.DevAuthenticator{},
-		sessions:      session.NewManager(),
-		heartbeatStop: make(chan struct{}),
-		router:        routing.NewStaticRouter(),
-		backends:      backend.NewRegistry(),
-		backendCaller: backend.NewCaller(cfg.BackendRPCTimeout),
+		cfg:                   cfg,
+		gatewayID:             gatewayID,
+		logger:                logger.With("gateway_id", gatewayID),
+		metrics:               metrics.New(gatewayID),
+		conns:                 make(map[string]*Connection),
+		authenticator:         auth.DevAuthenticator{},
+		sessions:              session.NewManager(),
+		heartbeatStop:         make(chan struct{}),
+		router:                routing.NewStaticRouter(),
+		backends:              backend.NewRegistry(),
+		backendCaller:         backend.NewCaller(cfg.BackendRPCTimeout),
+		reliabilityClassifier: reliability.NewStaticClassifier(),
+		reliability: reliability.NewManager(reliability.Config{
+			PendingLimit: cfg.ReliablePendingLimit, DedupWindow: cfg.ReliableDedupWindow, RetryInterval: cfg.ReliableRetryInterval, MaxRetries: cfg.ReliableMaxRetries,
+		}),
+		reliableStop: make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -84,6 +103,10 @@ func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Optio
 	if s.cfg.HeartbeatCheckInterval > 0 && s.cfg.IdleTimeout > 0 {
 		s.heartbeatWG.Add(1)
 		go s.heartbeatLoop()
+	}
+	if s.cfg.ReliableRetryInterval > 0 {
+		s.reliableWG.Add(1)
+		go s.reliableLoop()
 	}
 	return s
 }
@@ -109,6 +132,7 @@ func (s *Server) ConnectionCount() int {
 }
 func (s *Server) ActiveSessionCount() int                 { return s.sessions.ActiveCount() }
 func (s *Server) UnauthenticatedBusinessRejected() uint64 { return s.unauthRejects.Load() }
+func (s *Server) ReliablePendingCount() int               { return s.reliability.PendingCount() }
 
 func (s *Server) Close() {
 	if !s.closing.CompareAndSwap(false, true) {
@@ -116,6 +140,8 @@ func (s *Server) Close() {
 	}
 	close(s.heartbeatStop)
 	s.heartbeatWG.Wait()
+	close(s.reliableStop)
+	s.reliableWG.Wait()
 	s.mu.RLock()
 	list := make([]*Connection, 0, len(s.conns))
 	for _, c := range s.conns {
@@ -157,6 +183,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) removeConn(c *Connection) {
 	if ended := s.sessions.TerminateByConn(c.ID()); ended != nil {
+		s.reliability.RemoveSession(ended.ID)
+		s.metrics.SetReliablePending(s.reliability.PendingCount())
 		s.metrics.SetActiveSessions(s.sessions.ActiveCount())
 		s.logger.Info("session terminated", "session_id", ended.ID, "user_id", ended.UserID, "conn_id", ended.ConnID)
 	}
@@ -170,10 +198,17 @@ func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
 		s.handleAuth(c, env)
 		return
 	}
+	if env.MessageType == protocol.MessageTypeAck {
+		if c.Authenticated() {
+			s.reliability.Ack(c.SessionID(), env.Ack)
+			s.metrics.SetReliablePending(s.reliability.PendingCount())
+		}
+		return
+	}
 	if env.MessageType == protocol.MessageTypeHeartbeatRequest {
 		if c.Authenticated() {
 			resp := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeHeartbeatResponse, RequestID: env.RequestID, TimestampUnixMS: time.Now().UnixMilli()}
-			s.enqueueOrClose(c, resp)
+			s.sendEnvelope(c, resp)
 		}
 		return
 	}
@@ -183,6 +218,11 @@ func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
 		return
 	}
 	if env.MessageType >= protocol.BusinessMessageMin {
+		if s.reliabilityClassifier.Classify(env.MessageType) == reliability.DeliveryReliable {
+			if !s.acceptReliableInbound(c, env) {
+				return
+			}
+		}
 		s.handleBusiness(c, env)
 		return
 	}
@@ -190,7 +230,7 @@ func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
 		return
 	}
 	resp := protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeEchoResponse, RequestID: env.RequestID, Payload: env.Payload, TimestampUnixMS: time.Now().UnixMilli()}
-	s.enqueueOrClose(c, resp)
+	s.sendEnvelope(c, resp)
 }
 
 func (s *Server) handleBusiness(c *Connection, env protocol.Envelope) {
@@ -236,7 +276,7 @@ func (s *Server) handleBusiness(c *Connection, env protocol.Envelope) {
 		s.sendError(c, env.RequestID, "backend_invalid_response", false)
 		return
 	}
-	s.enqueueOrClose(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: outType, RequestID: env.RequestID, Payload: resp.Payload, TimestampUnixMS: time.Now().UnixMilli()})
+	s.sendEnvelope(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: outType, RequestID: env.RequestID, Payload: resp.Payload, TimestampUnixMS: time.Now().UnixMilli()})
 }
 
 func (s *Server) sendRoutingError(c *Connection, requestID string, err error) {
@@ -253,7 +293,7 @@ func (s *Server) sendRoutingError(c *Connection, requestID string, err error) {
 }
 
 func (s *Server) sendError(c *Connection, requestID, code string, retryable bool) {
-	s.enqueueOrClose(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeError, RequestID: requestID, Payload: protocol.MarshalErrorResponse(protocol.ErrorResponse{ErrorCode: code, Retryable: retryable}), TimestampUnixMS: time.Now().UnixMilli()})
+	s.sendEnvelope(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeError, RequestID: requestID, Payload: protocol.MarshalErrorResponse(protocol.ErrorResponse{ErrorCode: code, Retryable: retryable}), TimestampUnixMS: time.Now().UnixMilli()})
 }
 
 func (s *Server) handleAuth(c *Connection, env protocol.Envelope) {
@@ -299,11 +339,29 @@ func (s *Server) sendAuthResult(c *Connection, requestID string, result protocol
 		Payload:         protocol.MarshalAuthResult(result),
 		TimestampUnixMS: time.Now().UnixMilli(),
 	}
-	s.enqueueOrClose(c, resp)
+	s.sendEnvelope(c, resp)
 }
 
-func (s *Server) enqueueOrClose(c *Connection, env protocol.Envelope) {
-	if err := c.Enqueue(protocol.Marshal(env)); err != nil && errors.Is(err, ErrSendQueueFull) {
+func (s *Server) sendEnvelope(c *Connection, env protocol.Envelope) {
+	if c.Authenticated() && s.reliabilityClassifier.Classify(env.MessageType) == reliability.DeliveryReliable {
+		tracked, err := s.reliability.TrackOutbound(c.SessionID(), env, time.Now())
+		if err != nil {
+			if errors.Is(err, reliability.ErrPendingFull) {
+				s.metrics.ReliablePendingOverflow()
+				c.Close("reliable_pending_full")
+				return
+			}
+			c.Close("reliable_sequence_error")
+			return
+		}
+		env = tracked
+		s.metrics.SetReliablePending(s.reliability.PendingCount())
+	}
+	s.enqueueRawOrClose(c, protocol.Marshal(env))
+}
+
+func (s *Server) enqueueRawOrClose(c *Connection, data []byte) {
+	if err := c.Enqueue(data); err != nil && errors.Is(err, ErrSendQueueFull) {
 		c.Close("send_queue_full")
 	}
 }
@@ -339,6 +397,84 @@ func (s *Server) closeIdleConnections(now time.Time) {
 		if c.State() == ConnOpen && now.Sub(c.LastSeen()) > s.cfg.IdleTimeout {
 			if c.Close("heartbeat_timeout") {
 				s.metrics.HeartbeatTimeout()
+			}
+		}
+	}
+}
+
+func (s *Server) acceptReliableInbound(c *Connection, env protocol.Envelope) bool {
+	decision, err := s.reliability.AcceptInbound(c.SessionID(), env.MessageID, env.Seq)
+	if err == nil {
+		if decision == reliability.InboundDuplicate {
+			s.metrics.ReliableDedup()
+			s.sendAck(c, s.reliability.LastRecvSeq(c.SessionID()))
+			return false
+		}
+		s.sendAck(c, env.Seq)
+		return true
+	}
+	switch {
+	case errors.Is(err, reliability.ErrStaleSequence):
+		s.metrics.ReliableDedup()
+		s.sendAck(c, s.reliability.LastRecvSeq(c.SessionID()))
+	case errors.Is(err, reliability.ErrOutOfOrder):
+		s.metrics.ReliableOutOfOrder()
+		s.sendError(c, env.RequestID, "reliable_out_of_order", true)
+	case errors.Is(err, reliability.ErrInvalidMessageID), errors.Is(err, reliability.ErrInvalidSequence):
+		s.sendError(c, env.RequestID, "reliable_invalid_envelope", false)
+	case errors.Is(err, reliability.ErrMessageIDConflict), errors.Is(err, reliability.ErrSeqConflict):
+		s.sendError(c, env.RequestID, "reliable_sequence_conflict", false)
+	case errors.Is(err, reliability.ErrSeqExhausted):
+		s.sendError(c, env.RequestID, "reliable_sequence_exhausted", false)
+	default:
+		s.sendError(c, env.RequestID, "reliable_internal", false)
+	}
+	return false
+}
+
+func (s *Server) sendAck(c *Connection, ack uint64) {
+	if ack == 0 {
+		return
+	}
+	s.sendEnvelope(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: protocol.MessageTypeAck, Ack: ack, TimestampUnixMS: time.Now().UnixMilli()})
+}
+
+func (s *Server) connectionBySessionID(sessionID string) *Connection {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, c := range s.conns {
+		if c.SessionID() == sessionID && c.State() == ConnOpen {
+			return c
+		}
+	}
+	return nil
+}
+
+func (s *Server) reliableLoop() {
+	defer s.reliableWG.Done()
+	ticker := time.NewTicker(s.cfg.ReliableRetryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.reliableStop:
+			return
+		case now := <-ticker.C:
+			due, exhausted := s.reliability.CollectDue(now)
+			s.metrics.SetReliablePending(s.reliability.PendingCount())
+			for _, item := range due {
+				if !s.reliability.IsPending(item.SessionID, item.Envelope.Seq) {
+					continue
+				}
+				if c := s.connectionBySessionID(item.SessionID); c != nil {
+					s.metrics.ReliableRetry()
+					s.enqueueRawOrClose(c, protocol.Marshal(item.Envelope))
+				}
+			}
+			for _, item := range exhausted {
+				s.metrics.ReliableRetryExhausted()
+				if c := s.connectionBySessionID(item.SessionID); c != nil {
+					c.Close("reliable_retry_exhausted")
+				}
 			}
 		}
 	}

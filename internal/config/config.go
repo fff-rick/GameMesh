@@ -15,6 +15,10 @@ type Config struct {
 	HeartbeatCheckInterval time.Duration
 	IdleTimeout            time.Duration
 	BackendRPCTimeout      time.Duration
+	ReliableRetryInterval  time.Duration
+	ReliableMaxRetries     int
+	ReliablePendingLimit   int
+	ReliableDedupWindow    int
 }
 
 func Default() Config {
@@ -26,5 +30,9 @@ func Default() Config {
 		HeartbeatCheckInterval: 15 * time.Second,
 		IdleTimeout:            45 * time.Second,
 		BackendRPCTimeout:      500 * time.Millisecond,
+		ReliableRetryInterval:  500 * time.Millisecond,
+		ReliableMaxRetries:     3,
+		ReliablePendingLimit:   128,
+		ReliableDedupWindow:    256,
 	}
 }
