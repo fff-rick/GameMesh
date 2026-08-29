@@ -35,3 +35,11 @@ func TestAckIsKnownControlMessageType(t *testing.T) {
 		t.Fatalf("ack validate: %v", err)
 	}
 }
+
+func TestResumeMessageTypesAreValidControls(t *testing.T) {
+	for _, mt := range []uint32{MessageTypeResumeRequest, MessageTypeResumeResult} {
+		if err := (Envelope{Version: CurrentVersion, MessageType: mt}).Validate(); err != nil {
+			t.Fatalf("type=%d err=%v", mt, err)
+		}
+	}
+}

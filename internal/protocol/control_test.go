@@ -25,7 +25,7 @@ func TestAuthRequestRoundTrip(t *testing.T) {
 }
 
 func TestAuthResultRoundTrip(t *testing.T) {
-	want := AuthResult{OK: true, UserID: "alice", SessionID: "session-1"}
+	want := AuthResult{OK: true, UserID: "alice", SessionID: "session-1", ResumeToken: "resume-token"}
 	got, err := UnmarshalAuthResult(MarshalAuthResult(want))
 	if err != nil {
 		t.Fatal(err)
@@ -41,6 +41,37 @@ func TestAuthResultRoundTrip(t *testing.T) {
 	}
 	if got != fail {
 		t.Fatalf("got %#v want %#v", got, fail)
+	}
+}
+
+func TestResumeControlPayloadRoundTrip(t *testing.T) {
+	request := ResumeRequest{ResumeToken: "resume-token"}
+	gotRequest, err := UnmarshalResumeRequest(MarshalResumeRequest(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRequest != request {
+		t.Fatalf("request got %#v want %#v", gotRequest, request)
+	}
+
+	result := ResumeResult{OK: true, SessionID: "session-1", ResumeToken: "fresh-token"}
+	gotResult, err := UnmarshalResumeResult(MarshalResumeResult(result))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotResult != result {
+		t.Fatalf("result got %#v want %#v", gotResult, result)
+	}
+}
+
+func TestResumeControlPayloadSkipsUnknownFields(t *testing.T) {
+	payload := append(MarshalResumeResult(ResumeResult{OK: true, SessionID: "session-1"}), 0x28, 0x01)
+	got, err := UnmarshalResumeResult(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.OK || got.SessionID != "session-1" {
+		t.Fatalf("got %#v", got)
 	}
 }
 

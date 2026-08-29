@@ -22,6 +22,8 @@ const (
 	MessageTypeHeartbeatResponse uint32 = 13
 	MessageTypeError             uint32 = 14
 	MessageTypeAck               uint32 = 15
+	MessageTypeResumeRequest     uint32 = 16
+	MessageTypeResumeResult      uint32 = 17
 	BusinessMessageMin           uint32 = 1000
 )
 
@@ -48,7 +50,7 @@ func (e Envelope) Validate() error {
 
 func isKnownControlMessageType(mt uint32) bool {
 	switch mt {
-	case MessageTypeEchoRequest, MessageTypeEchoResponse, MessageTypeAuthRequest, MessageTypeAuthResult, MessageTypeHeartbeatRequest, MessageTypeHeartbeatResponse, MessageTypeError, MessageTypeAck:
+	case MessageTypeEchoRequest, MessageTypeEchoResponse, MessageTypeAuthRequest, MessageTypeAuthResult, MessageTypeHeartbeatRequest, MessageTypeHeartbeatResponse, MessageTypeError, MessageTypeAck, MessageTypeResumeRequest, MessageTypeResumeResult:
 		return true
 	default:
 		return false
