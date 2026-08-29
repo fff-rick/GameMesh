@@ -94,3 +94,19 @@ func TestRecoveryMetricsDoNotExposeSessionSecrets(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionMetricsPublishActiveAndGraceAsOneSnapshot(t *testing.T) {
+	m := New("gw-1")
+	m.SetSessionCounts(3, 2)
+	var b strings.Builder
+	m.WritePrometheus(&b)
+	got := b.String()
+	for _, want := range []string{
+		`game_gateway_sessions{gateway_id="gw-1",state="active"} 3`,
+		`game_gateway_sessions{gateway_id="gw-1",state="grace"} 2`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing paired session count %q in:\n%s", want, got)
+		}
+	}
+}

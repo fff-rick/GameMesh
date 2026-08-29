@@ -19,8 +19,7 @@ type Metrics struct {
 	bytesReceived           atomic.Uint64
 	bytesSent               atomic.Uint64
 	queueDepthMax           atomic.Int64
-	activeSessions          atomic.Int64
-	graceSessions           atomic.Int64
+	sessionCounts           atomic.Pointer[sessionCounts]
 	graceExpired            atomic.Uint64
 	heartbeatTimeouts       atomic.Uint64
 	reliablePending         atomic.Int64
@@ -37,8 +36,15 @@ type Metrics struct {
 	backendRPCLatency       map[string]latencyAgg
 }
 
+type sessionCounts struct {
+	active int64
+	grace  int64
+}
+
 func New(gatewayID string) *Metrics {
-	return &Metrics{gatewayID: gatewayID, disconnects: map[string]uint64{}, authResults: map[string]uint64{}, recoveryResults: map[string]uint64{}, backendRPCResults: map[string]uint64{}, backendRPCLatency: map[string]latencyAgg{}}
+	m := &Metrics{gatewayID: gatewayID, disconnects: map[string]uint64{}, authResults: map[string]uint64{}, recoveryResults: map[string]uint64{}, backendRPCResults: map[string]uint64{}, backendRPCLatency: map[string]latencyAgg{}}
+	m.sessionCounts.Store(&sessionCounts{})
+	return m
 }
 func (m *Metrics) ConnectionOpened() { m.connections.Add(1); m.connectionsTotal.Add(1) }
 func (m *Metrics) ConnectionClosed(reason string) {
@@ -47,10 +53,29 @@ func (m *Metrics) ConnectionClosed(reason string) {
 	m.disconnects[reason]++
 	m.mu.Unlock()
 }
-func (m *Metrics) Received(n int)           { m.messagesReceived.Add(1); m.bytesReceived.Add(uint64(n)) }
-func (m *Metrics) Sent(n int)               { m.messagesSent.Add(1); m.bytesSent.Add(uint64(n)) }
-func (m *Metrics) SetActiveSessions(n int)  { m.activeSessions.Store(int64(n)) }
-func (m *Metrics) SetGraceSessions(n int)   { m.graceSessions.Store(int64(n)) }
+func (m *Metrics) Received(n int) { m.messagesReceived.Add(1); m.bytesReceived.Add(uint64(n)) }
+func (m *Metrics) Sent(n int)     { m.messagesSent.Add(1); m.bytesSent.Add(uint64(n)) }
+func (m *Metrics) SetActiveSessions(n int) {
+	for {
+		old := m.sessionCounts.Load()
+		next := &sessionCounts{active: int64(n), grace: old.grace}
+		if m.sessionCounts.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+func (m *Metrics) SetGraceSessions(n int) {
+	for {
+		old := m.sessionCounts.Load()
+		next := &sessionCounts{active: old.active, grace: int64(n)}
+		if m.sessionCounts.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+func (m *Metrics) SetSessionCounts(active, grace int) {
+	m.sessionCounts.Store(&sessionCounts{active: int64(active), grace: int64(grace)})
+}
 func (m *Metrics) GraceExpired()            { m.graceExpired.Add(1) }
 func (m *Metrics) HeartbeatTimeout()        { m.heartbeatTimeouts.Add(1) }
 func (m *Metrics) SetReliablePending(n int) { m.reliablePending.Store(int64(n)) }
@@ -102,6 +127,7 @@ func (m *Metrics) ObserveQueueDepth(n int) {
 }
 func (m *Metrics) WritePrometheus(w io.Writer) {
 	gid := escape(m.gatewayID)
+	sessions := m.sessionCounts.Load()
 	fmt.Fprintf(w, "# TYPE game_gateway_connections gauge\ngame_gateway_connections{gateway_id=\"%s\",state=\"open\"} %d\n", gid, m.connections.Load())
 	fmt.Fprintf(w, "# TYPE game_gateway_connections_total counter\ngame_gateway_connections_total{gateway_id=\"%s\",result=\"accepted\"} %d\n", gid, m.connectionsTotal.Load())
 	fmt.Fprintf(w, "# TYPE game_gateway_messages_received_total counter\ngame_gateway_messages_received_total{gateway_id=\"%s\",class=\"envelope\"} %d\n", gid, m.messagesReceived.Load())
@@ -109,8 +135,8 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 	fmt.Fprintf(w, "game_gateway_message_bytes_received_total{gateway_id=\"%s\"} %d\n", gid, m.bytesReceived.Load())
 	fmt.Fprintf(w, "game_gateway_message_bytes_sent_total{gateway_id=\"%s\"} %d\n", gid, m.bytesSent.Load())
 	fmt.Fprintf(w, "game_gateway_send_queue_depth_max{gateway_id=\"%s\"} %d\n", gid, m.queueDepthMax.Load())
-	fmt.Fprintf(w, "# TYPE game_gateway_sessions gauge\ngame_gateway_sessions{gateway_id=\"%s\",state=\"active\"} %d\n", gid, m.activeSessions.Load())
-	fmt.Fprintf(w, "game_gateway_sessions{gateway_id=\"%s\",state=\"grace\"} %d\n", gid, m.graceSessions.Load())
+	fmt.Fprintf(w, "# TYPE game_gateway_sessions gauge\ngame_gateway_sessions{gateway_id=\"%s\",state=\"active\"} %d\n", gid, sessions.active)
+	fmt.Fprintf(w, "game_gateway_sessions{gateway_id=\"%s\",state=\"grace\"} %d\n", gid, sessions.grace)
 	fmt.Fprintf(w, "# TYPE game_gateway_session_grace_expired_total counter\ngame_gateway_session_grace_expired_total{gateway_id=\"%s\"} %d\n", gid, m.graceExpired.Load())
 	fmt.Fprintf(w, "# TYPE game_gateway_heartbeat_timeouts_total counter\ngame_gateway_heartbeat_timeouts_total{gateway_id=\"%s\"} %d\n", gid, m.heartbeatTimeouts.Load())
 	fmt.Fprintf(w, "# TYPE game_gateway_reliable_pending gauge\ngame_gateway_reliable_pending{gateway_id=\"%s\"} %d\n", gid, m.reliablePending.Load())

@@ -214,6 +214,17 @@ func (a tokenAuthenticator) Authenticate(_ context.Context, token string) (strin
 	return "", auth.ErrInvalidToken
 }
 
+type blockingAuthenticator struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a blockingAuthenticator) Authenticate(context.Context, string) (string, error) {
+	close(a.entered)
+	<-a.release
+	return "alice", nil
+}
+
 func sendAuth(t *testing.T, c *ws.Conn, token string) protocol.AuthResult {
 	t.Helper()
 	req := protocol.Envelope{
@@ -392,6 +403,48 @@ func TestAuthenticatedResumeRequestIsRejected(t *testing.T) {
 	}
 }
 
+func TestServerCloseConcurrentAuthenticationLeavesNoSessionState(t *testing.T) {
+	authenticator := blockingAuthenticator{entered: make(chan struct{}), release: make(chan struct{})}
+	cfg := config.Default()
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(authenticator))
+	ts := httptest.NewServer(gw.Handler())
+	defer ts.Close()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+	c := dial(t, url)
+
+	writeEnvelope(t, c, protocol.Envelope{
+		Version:     protocol.CurrentVersion,
+		MessageType: protocol.MessageTypeAuthRequest,
+		RequestID:   "auth-during-close",
+		Payload:     protocol.MarshalAuthRequest(protocol.AuthRequest{Token: "blocked"}),
+	})
+	select {
+	case <-authenticator.entered:
+	case <-time.After(time.Second):
+		t.Fatal("authenticator was not entered")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		gw.Close()
+		close(closed)
+	}()
+	waitFor(t, time.Second, func() bool { return gw.closing.Load() && gw.ConnectionCount() == 0 })
+	close(authenticator.release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("server close did not finish")
+	}
+
+	if got := gw.ActiveSessionCount(); got != 0 {
+		t.Fatalf("sessions after concurrent shutdown=%d", got)
+	}
+	if got := gw.ReliablePendingCount(); got != 0 {
+		t.Fatalf("pending after concurrent shutdown=%d", got)
+	}
+}
+
 func TestInvalidAndExpiredTokenDoNotCreateSession(t *testing.T) {
 	cfg := config.Default()
 	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}))
@@ -505,6 +558,63 @@ func TestDuplicateLoginImmediatelyRemovesReplacedReliabilityState(t *testing.T) 
 		t.Fatalf("new auth=%#v", result)
 	}
 	waitFor(t, time.Second, func() bool { return gw.ReliablePendingCount() == 0 })
+}
+
+func TestDuplicateLoginCannotRecreateReliabilityStateFromInFlightBackendResponse(t *testing.T) {
+	cfg := config.Default()
+	cfg.ReliableRetryInterval = time.Second
+	backendEntered := make(chan struct{})
+	backendRelease := make(chan struct{})
+	r := routing.NewStaticRouter()
+	r.SetMessageBackend(1001, "room")
+	r.SetUserRoom("alice", "room-1")
+	r.SetRoomInstance("room-1", routing.BackendInstance{ID: "room-a", BackendType: "room", Address: "inproc"})
+	reg := backend.NewRegistry()
+	reg.Set("room-a", fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		close(backendEntered)
+		<-backendRelease
+		return backend.Response{MessageType: 1002, Payload: []byte("stale")}, nil
+	}})
+	gw := New(
+		cfg,
+		"test-gateway",
+		testLogger(),
+		WithAuthenticator(tokenAuthenticator{"one": "alice", "two": "alice"}),
+		WithRouter(r),
+		WithBackendRegistry(reg),
+		WithReliabilityClassifier(reliability.NewStaticClassifier(1002)),
+	)
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+
+	oldClient := dial(t, url)
+	oldAuth := sendAuth(t, oldClient, "one")
+	oldServerConn := gw.connectionBySessionID(oldAuth.SessionID)
+	if oldServerConn == nil {
+		t.Fatal("old server connection not found")
+	}
+	writeEnvelope(t, oldClient, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "in-flight"})
+	select {
+	case <-backendEntered:
+	case <-time.After(time.Second):
+		t.Fatal("backend was not entered")
+	}
+
+	newClient := dial(t, url)
+	defer newClient.Close()
+	if result := sendAuth(t, newClient, "two"); !result.OK {
+		t.Fatalf("new auth=%#v", result)
+	}
+	if got := gw.ReliablePendingCount(); got != 0 {
+		t.Fatalf("pending immediately after replacement=%d", got)
+	}
+
+	close(backendRelease)
+	oldServerConn.Wait()
+	if got := gw.ReliablePendingCount(); got != 0 {
+		t.Fatalf("stale backend response recreated pending state=%d", got)
+	}
 }
 
 func TestServerShutdownImmediatelyRemovesGraceSessionState(t *testing.T) {
