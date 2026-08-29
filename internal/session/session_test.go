@@ -1,8 +1,10 @@
 package session
 
 import (
+	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRegisterAndTerminateByConn(t *testing.T) {
@@ -83,5 +85,97 @@ func TestConcurrentSameUserHasExactlyOneActiveWinner(t *testing.T) {
 	}
 	if got, ok := m.ByConn(winner.ConnID); !ok || got.ID != winner.ID {
 		t.Fatalf("by conn %#v %v", got, ok)
+	}
+}
+
+func TestDisconnectThenResumeKeepsSessionAndRotatesToken(t *testing.T) {
+	now := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	m := NewManager(time.Minute)
+	original, _, err := m.Register("alice", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if original.ResumeToken == "" {
+		t.Fatal("register did not issue a resume token")
+	}
+	if ended := m.Disconnect("old", now); ended == nil {
+		t.Fatal("disconnect did not retain the session")
+	}
+
+	resumed, err := m.Resume(original.ResumeToken, "new", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.ID != original.ID || resumed.ConnID != "new" || resumed.ResumeToken == original.ResumeToken {
+		t.Fatalf("resumed=%#v", resumed)
+	}
+	if _, err := m.Resume(original.ResumeToken, "replay", now.Add(time.Second)); !errors.Is(err, ErrInvalidResumeToken) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestExpireRemovesOnlyGraceSessionsPastDeadline(t *testing.T) {
+	now := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	m := NewManager(time.Minute)
+	grace, _, err := m.Register("grace", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, _, err := m.Register("active", "current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended := m.Disconnect(grace.ConnID, now); ended == nil {
+		t.Fatal("disconnect did not retain grace session")
+	}
+
+	expired := m.Expire(now.Add(time.Minute))
+	if len(expired) != 1 || expired[0].ID != grace.ID {
+		t.Fatalf("expired=%#v", expired)
+	}
+	if got, ok := m.ByUser(active.UserID); !ok || got.ID != active.ID {
+		t.Fatal("active session removed")
+	}
+	if _, ok := m.ByUser(grace.UserID); ok {
+		t.Fatal("expired session retained")
+	}
+}
+
+func TestOldConnectionDisconnectDoesNotRemoveResumedSession(t *testing.T) {
+	now := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	m := NewManager(time.Minute)
+	s, _, err := m.Register("alice", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended := m.Disconnect("old", now); ended == nil {
+		t.Fatal("disconnect did not retain the session")
+	}
+	resumed, err := m.Resume(s.ResumeToken, "new", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ended := m.Disconnect("old", now); ended != nil {
+		t.Fatalf("ended=%#v", ended)
+	}
+	if got, ok := m.ByUser("alice"); !ok || got.ConnID != "new" || got.ID != resumed.ID {
+		t.Fatalf("got=%#v", got)
+	}
+}
+
+func TestResumeRejectsEmptyConnectionID(t *testing.T) {
+	now := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+	m := NewManager(time.Minute)
+	s, _, err := m.Register("alice", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended := m.Disconnect(s.ConnID, now); ended == nil {
+		t.Fatal("disconnect did not retain the session")
+	}
+
+	if _, err := m.Resume(s.ResumeToken, "", now); !errors.Is(err, ErrInvalidConnID) {
+		t.Fatalf("err=%v", err)
 	}
 }
