@@ -70,3 +70,27 @@ func TestStage4MetricsExposeReliabilityState(t *testing.T) {
 		}
 	}
 }
+
+func TestRecoveryMetricsDoNotExposeSessionSecrets(t *testing.T) {
+	m := New("gw-1")
+	m.RecoveryResult("success")
+	m.SetGraceSessions(2)
+	m.GraceExpired()
+	var b strings.Builder
+	m.WritePrometheus(&b)
+	got := b.String()
+	for _, want := range []string{
+		`game_gateway_recovery_total{gateway_id="gw-1",result="success"} 1`,
+		`game_gateway_sessions{gateway_id="gw-1",state="grace"} 2`,
+		`game_gateway_session_grace_expired_total{gateway_id="gw-1"} 1`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in:\n%s", want, got)
+		}
+	}
+	for _, secret := range []string{"resume-secret-token", "session-secret-id", "user-secret-id"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("metrics exposed secret %q in:\n%s", secret, got)
+		}
+	}
+}
