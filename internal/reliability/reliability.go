@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -268,22 +269,58 @@ func (m *Manager) CollectDue(now time.Time) (due []Retransmission, exhausted []R
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for sessionID, st := range m.sessions {
-		for seq, p := range st.pending {
-			if now.Before(p.NextRetry) {
-				continue
-			}
-			if p.RetryCount >= m.cfg.MaxRetries {
-				exhausted = append(exhausted, Retransmission{SessionID: sessionID, Envelope: cloneEnvelope(p.Envelope), RetryCount: p.RetryCount})
-				delete(st.pending, seq)
-				continue
-			}
-			p.RetryCount++
-			p.NextRetry = now.Add(m.cfg.RetryInterval)
-			st.pending[seq] = p
-			due = append(due, Retransmission{SessionID: sessionID, Envelope: cloneEnvelope(p.Envelope), RetryCount: p.RetryCount})
+		due, exhausted = m.collectDueLocked(sessionID, st, now, due, exhausted)
+	}
+	return due, exhausted
+}
+
+func (m *Manager) CollectDueForSessions(now time.Time, sessionIDs []string) (due []Retransmission, exhausted []Retransmission) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := make(map[string]struct{}, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if _, ok := seen[sessionID]; ok {
+			continue
+		}
+		seen[sessionID] = struct{}{}
+		if st := m.sessions[sessionID]; st != nil {
+			due, exhausted = m.collectDueLocked(sessionID, st, now, due, exhausted)
 		}
 	}
 	return due, exhausted
+}
+
+func (m *Manager) collectDueLocked(sessionID string, st *sessionState, now time.Time, due, exhausted []Retransmission) ([]Retransmission, []Retransmission) {
+	for seq, p := range st.pending {
+		if now.Before(p.NextRetry) {
+			continue
+		}
+		if p.RetryCount >= m.cfg.MaxRetries {
+			exhausted = append(exhausted, Retransmission{SessionID: sessionID, Envelope: cloneEnvelope(p.Envelope), RetryCount: p.RetryCount})
+			delete(st.pending, seq)
+			continue
+		}
+		p.RetryCount++
+		p.NextRetry = now.Add(m.cfg.RetryInterval)
+		st.pending[seq] = p
+		due = append(due, Retransmission{SessionID: sessionID, Envelope: cloneEnvelope(p.Envelope), RetryCount: p.RetryCount})
+	}
+	return due, exhausted
+}
+
+func (m *Manager) Pending(sessionID string) []protocol.Envelope {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.sessions[sessionID]
+	if st == nil {
+		return nil
+	}
+	pending := make([]protocol.Envelope, 0, len(st.pending))
+	for _, entry := range st.pending {
+		pending = append(pending, cloneEnvelope(entry.Envelope))
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].Seq < pending[j].Seq })
+	return pending
 }
 
 func (m *Manager) PendingCount() int {

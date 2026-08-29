@@ -419,9 +419,27 @@ func (s *Server) handleResume(c *Connection, env protocol.Envelope) {
 	c.bindIdentity(resumed.UserID, resumed.ID)
 	s.graceSessions.Add(-1)
 	s.updateSessionMetricsLocked()
+	pending := s.reliability.Pending(resumed.ID)
+	resumeEnvelope := protocol.Envelope{
+		Version:         protocol.CurrentVersion,
+		MessageType:     protocol.MessageTypeResumeResult,
+		RequestID:       env.RequestID,
+		Payload:         protocol.MarshalResumeResult(protocol.ResumeResult{OK: true, SessionID: resumed.ID, ResumeToken: resumed.ResumeToken}),
+		TimestampUnixMS: time.Now().UnixMilli(),
+	}
+	enqueueErr := c.Enqueue(protocol.Marshal(resumeEnvelope))
+	if enqueueErr == nil {
+		for _, replay := range pending {
+			if enqueueErr = c.Enqueue(protocol.Marshal(replay)); enqueueErr != nil {
+				break
+			}
+		}
+	}
 	s.lifecycleMu.Unlock()
 	s.metrics.RecoveryResult("success")
-	s.sendResumeResult(c, env.RequestID, protocol.ResumeResult{OK: true, SessionID: resumed.ID, ResumeToken: resumed.ResumeToken})
+	if errors.Is(enqueueErr, ErrSendQueueFull) {
+		c.Close("send_queue_full")
+	}
 }
 
 func (s *Server) sendAuthResult(c *Connection, requestID string, result protocol.AuthResult) {
@@ -625,22 +643,50 @@ func (s *Server) reliableLoop() {
 		case <-s.reliableStop:
 			return
 		case now := <-ticker.C:
-			due, exhausted := s.reliability.CollectDue(now)
+			s.lifecycleMu.Lock()
+			s.mu.RLock()
+			active := make(map[string]*Connection)
+			for _, c := range s.conns {
+				if !c.Authenticated() || c.State() != ConnOpen {
+					continue
+				}
+				current, ok := s.sessions.ByConn(c.ID())
+				if ok && current.ID == c.SessionID() && current.GraceDeadline.IsZero() {
+					active[current.ID] = c
+				}
+			}
+			s.mu.RUnlock()
+			activeSessionIDs := make([]string, 0, len(active))
+			for sessionID := range active {
+				activeSessionIDs = append(activeSessionIDs, sessionID)
+			}
+			due, exhausted := s.reliability.CollectDueForSessions(now, activeSessionIDs)
 			s.metrics.SetReliablePending(s.reliability.PendingCount())
+			var closeFull []*Connection
 			for _, item := range due {
 				if !s.reliability.IsPending(item.SessionID, item.Envelope.Seq) {
 					continue
 				}
-				if c := s.connectionBySessionID(item.SessionID); c != nil {
+				if c := active[item.SessionID]; c != nil {
 					s.metrics.ReliableRetry()
-					s.enqueueRawOrClose(c, protocol.Marshal(item.Envelope))
+					if err := c.Enqueue(protocol.Marshal(item.Envelope)); errors.Is(err, ErrSendQueueFull) {
+						closeFull = append(closeFull, c)
+					}
 				}
 			}
+			var closeExhausted []*Connection
 			for _, item := range exhausted {
 				s.metrics.ReliableRetryExhausted()
-				if c := s.connectionBySessionID(item.SessionID); c != nil {
-					c.Close("reliable_retry_exhausted")
+				if c := active[item.SessionID]; c != nil {
+					closeExhausted = append(closeExhausted, c)
 				}
+			}
+			s.lifecycleMu.Unlock()
+			for _, c := range closeFull {
+				c.Close("send_queue_full")
+			}
+			for _, c := range closeExhausted {
+				c.Close("reliable_retry_exhausted")
 			}
 		}
 	}

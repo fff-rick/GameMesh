@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -794,6 +795,33 @@ func readEnvelope(t *testing.T, c *ws.Conn) protocol.Envelope {
 	return env
 }
 
+func readEnvelopeWithin(t *testing.T, c *ws.Conn, timeout time.Duration) protocol.Envelope {
+	t.Helper()
+	type result struct {
+		data []byte
+		err  error
+	}
+	resultC := make(chan result, 1)
+	go func() {
+		data, err := c.ReadBinary(64 * 1024)
+		resultC <- result{data: data, err: err}
+	}()
+	select {
+	case got := <-resultC:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		env, err := protocol.Unmarshal(got.data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return env
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for envelope")
+		return protocol.Envelope{}
+	}
+}
+
 func setupRoutedServer(t *testing.T, client backend.Client) (*Server, *ws.Conn, *routing.StaticRouter, *backend.Registry) {
 	t.Helper()
 	cfg := config.Default()
@@ -1043,6 +1071,86 @@ func TestConnectionCloseBeforeAckRetainsReliablePendingUntilGraceExpiry(t *testi
 		t.Fatalf("sessions during grace=%d", got)
 	}
 	waitFor(t, time.Second, func() bool { return gw.ReliablePendingCount() == 0 && gw.ActiveSessionCount() == 0 })
+}
+
+func setupReliableRecoveryServer(t *testing.T, cfg config.Config) (*Server, string) {
+	t.Helper()
+	r := routing.NewStaticRouter()
+	r.SetMessageBackend(1001, "room")
+	r.SetUserRoom("alice", "room-1")
+	r.SetRoomInstance("room-1", routing.BackendInstance{ID: "room-a", BackendType: "room", Address: "inproc"})
+	reg := backend.NewRegistry()
+	reg.Set("room-a", fakeBackendClient{handle: func(_ context.Context, req backend.Request) (backend.Response, error) {
+		return backend.Response{MessageType: 1002, Payload: []byte(req.RequestID)}, nil
+	}})
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}), WithRouter(r), WithBackendRegistry(reg), WithReliabilityClassifier(reliability.NewStaticClassifier(1002)))
+	ts := httptest.NewServer(gw.Handler())
+	t.Cleanup(func() { gw.Close(); ts.Close() })
+	return gw, strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+}
+
+func TestCollectDueDoesNotConsumeRetriesWhileSessionIsDisconnected(t *testing.T) {
+	cfg := config.Default()
+	cfg.SessionGracePeriod = time.Second
+	cfg.ReliableRetryInterval = 15 * time.Millisecond
+	cfg.ReliableMaxRetries = 1
+	gw, url := setupReliableRecoveryServer(t, cfg)
+
+	oldConn := dial(t, url)
+	authResult := sendAuth(t, oldConn, "valid")
+	writeEnvelope(t, oldConn, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "original"})
+	original := readEnvelope(t, oldConn)
+	_ = oldConn.WriteClose()
+	_ = oldConn.Close()
+	waitFor(t, time.Second, func() bool { return gw.ConnectionCount() == 0 })
+	time.Sleep(75 * time.Millisecond)
+	if got := gw.ReliablePendingCount(); got != 1 {
+		t.Fatalf("pending during grace=%d", got)
+	}
+
+	newConn := dial(t, url)
+	defer newConn.Close()
+	if result := sendResume(t, newConn, authResult.ResumeToken); !result.OK {
+		t.Fatalf("resume=%#v", result)
+	}
+	replayed := readEnvelopeWithin(t, newConn, 250*time.Millisecond)
+	if !reflect.DeepEqual(replayed, original) {
+		t.Fatalf("replayed=%#v original=%#v", replayed, original)
+	}
+}
+
+func TestResumeReplaysReliablePendingInOriginalSequence(t *testing.T) {
+	cfg := config.Default()
+	cfg.SessionGracePeriod = time.Second
+	cfg.ReliableRetryInterval = time.Second
+	gw, url := setupReliableRecoveryServer(t, cfg)
+
+	oldConn := dial(t, url)
+	authResult := sendAuth(t, oldConn, "valid")
+	writeEnvelope(t, oldConn, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "first"})
+	first := readEnvelope(t, oldConn)
+	writeEnvelope(t, oldConn, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "second"})
+	second := readEnvelope(t, oldConn)
+	if first.Seq != 1 || second.Seq != 2 || first.MessageID == "" || second.MessageID == "" {
+		t.Fatalf("first=%#v second=%#v", first, second)
+	}
+	_ = oldConn.WriteClose()
+	_ = oldConn.Close()
+	waitFor(t, time.Second, func() bool { return gw.ConnectionCount() == 0 && gw.ReliablePendingCount() == 2 })
+
+	newConn := dial(t, url)
+	defer newConn.Close()
+	if result := sendResume(t, newConn, authResult.ResumeToken); !result.OK {
+		t.Fatalf("resume=%#v", result)
+	}
+	replayedFirst := readEnvelopeWithin(t, newConn, 250*time.Millisecond)
+	replayedSecond := readEnvelopeWithin(t, newConn, 250*time.Millisecond)
+	if !reflect.DeepEqual(replayedFirst, first) || !reflect.DeepEqual(replayedSecond, second) {
+		t.Fatalf("replayed first=%#v second=%#v; originals first=%#v second=%#v", replayedFirst, replayedSecond, first, second)
+	}
+	if got := gw.ReliablePendingCount(); got != 2 {
+		t.Fatalf("pending after replay=%d", got)
+	}
 }
 
 func TestReliablePendingOverflowClosesConnection(t *testing.T) {
