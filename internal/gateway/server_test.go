@@ -266,6 +266,11 @@ func sendResume(t *testing.T, c *ws.Conn, token string) protocol.ResumeResult {
 	if err := c.WriteBinary(protocol.Marshal(req)); err != nil {
 		t.Fatal(err)
 	}
+	return readResumeResult(t, c)
+}
+
+func readResumeResult(t *testing.T, c *ws.Conn) protocol.ResumeResult {
+	t.Helper()
 	data, err := c.ReadBinary(64 * 1024)
 	if err != nil {
 		t.Fatal(err)
@@ -1185,4 +1190,124 @@ func TestReliableOutboundStopsAfterMaxRetries(t *testing.T) {
 		t.Fatalf("retry=%#v", retry)
 	}
 	waitFor(t, 500*time.Millisecond, func() bool { return gw.ConnectionCount() == 0 && gw.ReliablePendingCount() == 0 })
+}
+
+func TestResumeSucceedsWhenBackendIsUnavailable(t *testing.T) {
+	process, backendConn := startFakeBackendProcess(t, "success")
+	cfg := config.Default()
+	cfg.SessionGracePeriod = time.Second
+	r := routing.NewStaticRouter()
+	r.SetMessageBackend(1001, "room")
+	r.SetUserRoom("alice", "room-1")
+	r.SetRoomInstance("room-1", routing.BackendInstance{ID: "room-a", BackendType: "room", Address: "grpc"})
+	reg := backend.NewRegistry()
+	reg.Set("room-a", backend.NewGRPCClient(backendConn))
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}), WithRouter(r), WithBackendRegistry(reg))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+
+	oldConn := dial(t, url)
+	authResult := sendAuth(t, oldConn, "valid")
+	if !authResult.OK {
+		t.Fatalf("auth=%#v", authResult)
+	}
+	_ = oldConn.WriteClose()
+	_ = oldConn.Close()
+	waitFor(t, time.Second, func() bool { return gw.ConnectionCount() == 0 })
+	process.stop()
+
+	resumedConn := dial(t, url)
+	defer resumedConn.Close()
+	resumeResult := sendResume(t, resumedConn, authResult.ResumeToken)
+	if !resumeResult.OK || resumeResult.SessionID != authResult.SessionID {
+		t.Fatalf("resume=%#v auth=%#v", resumeResult, authResult)
+	}
+	assertErrorEnvelope(t, sendBusiness(t, resumedConn, 1001, "after-resume", []byte("move")), "backend_unavailable", true)
+}
+
+func TestConcurrentResumeTokenUseHasOneWinner(t *testing.T) {
+	cfg := config.Default()
+	cfg.SessionGracePeriod = time.Second
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+
+	oldConn := dial(t, url)
+	authResult := sendAuth(t, oldConn, "valid")
+	if !authResult.OK {
+		t.Fatalf("auth=%#v", authResult)
+	}
+	_ = oldConn.WriteClose()
+	_ = oldConn.Close()
+	waitFor(t, time.Second, func() bool { return gw.ConnectionCount() == 0 })
+
+	first := dial(t, url)
+	defer first.Close()
+	second := dial(t, url)
+	defer second.Close()
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	request := protocol.Envelope{
+		Version:     protocol.CurrentVersion,
+		MessageType: protocol.MessageTypeResumeRequest,
+		RequestID:   "resume",
+		Payload:     protocol.MarshalResumeRequest(protocol.ResumeRequest{ResumeToken: authResult.ResumeToken}),
+	}
+	for _, c := range []*ws.Conn{first, second} {
+		go func(c *ws.Conn) {
+			<-start
+			errs <- c.WriteBinary(protocol.Marshal(request))
+		}(c)
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstResult := readResumeResult(t, first)
+	secondResult := readResumeResult(t, second)
+
+	winners := 0
+	for _, result := range []protocol.ResumeResult{firstResult, secondResult} {
+		if result.OK {
+			winners++
+			if result.SessionID != authResult.SessionID || result.ResumeToken == authResult.ResumeToken {
+				t.Fatalf("successful resume=%#v auth=%#v", result, authResult)
+			}
+			continue
+		}
+		if result.ErrorCode != "resume_token_invalid" {
+			t.Fatalf("failed resume=%#v", result)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("successful resumes=%d results=%#v,%#v", winners, firstResult, secondResult)
+	}
+	if got := gw.ActiveSessionCount(); got != 1 {
+		t.Fatalf("sessions=%d", got)
+	}
+}
+
+func TestGraceExpiryReleasesReliablePending(t *testing.T) {
+	cfg := config.Default()
+	cfg.SessionGracePeriod = 40 * time.Millisecond
+	cfg.ReliableRetryInterval = time.Second
+	gw, url := setupReliableRecoveryServer(t, cfg)
+
+	c := dial(t, url)
+	if result := sendAuth(t, c, "valid"); !result.OK {
+		t.Fatalf("auth=%#v", result)
+	}
+	writeEnvelope(t, c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: 1001, RequestID: "pending-before-expiry"})
+	if response := readEnvelope(t, c); response.Seq == 0 {
+		t.Fatalf("response=%#v", response)
+	}
+	waitFor(t, time.Second, func() bool { return gw.ReliablePendingCount() == 1 })
+	_ = c.WriteClose()
+	_ = c.Close()
+	waitFor(t, time.Second, func() bool { return gw.ConnectionCount() == 0 })
+	waitFor(t, time.Second, func() bool { return gw.ReliablePendingCount() == 0 })
 }
