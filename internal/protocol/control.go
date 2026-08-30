@@ -124,12 +124,16 @@ func UnmarshalAuthResult(b []byte) (AuthResult, error) {
 
 type ResumeRequest struct {
 	ResumeToken string
+	LastAckSeq  uint64
 }
 
 func MarshalResumeRequest(v ResumeRequest) []byte {
 	var b []byte
 	if v.ResumeToken != "" {
 		b = appendBytesField(b, 1, []byte(v.ResumeToken))
+	}
+	if v.LastAckSeq != 0 {
+		b = appendVarintField(b, 2, v.LastAckSeq)
 	}
 	return b
 }
@@ -142,7 +146,8 @@ func UnmarshalResumeRequest(b []byte) (ResumeRequest, error) {
 			return ResumeRequest{}, ErrMalformedControlPayload
 		}
 		b = rest
-		if field == 1 {
+		switch field {
+		case 1:
 			if wire != 2 {
 				return ResumeRequest{}, ErrMalformedControlPayload
 			}
@@ -152,12 +157,22 @@ func UnmarshalResumeRequest(b []byte) (ResumeRequest, error) {
 			}
 			out.ResumeToken = string(v)
 			b = rest
-			continue
-		}
-		var skipped bool
-		b, skipped = skipField(wire, b)
-		if !skipped {
-			return ResumeRequest{}, ErrMalformedControlPayload
+		case 2:
+			if wire != 0 {
+				return ResumeRequest{}, ErrMalformedControlPayload
+			}
+			v, n := consumeVarint(b)
+			if n <= 0 {
+				return ResumeRequest{}, ErrMalformedControlPayload
+			}
+			out.LastAckSeq = v
+			b = b[n:]
+		default:
+			var skipped bool
+			b, skipped = skipField(wire, b)
+			if !skipped {
+				return ResumeRequest{}, ErrMalformedControlPayload
+			}
 		}
 	}
 	return out, nil

@@ -256,12 +256,20 @@ func sendAuth(t *testing.T, c *ws.Conn, token string) protocol.AuthResult {
 }
 
 func sendResume(t *testing.T, c *ws.Conn, token string) protocol.ResumeResult {
+	return sendResumeWithLastAck(t, c, token, 0)
+}
+
+func sendResumeWithLastAck(t *testing.T, c *ws.Conn, token string, lastAck uint64) protocol.ResumeResult {
 	t.Helper()
+	payload := protocol.MarshalResumeRequest(protocol.ResumeRequest{ResumeToken: token})
+	if lastAck > 0 {
+		payload = append(payload, 0x10, byte(lastAck)) // protobuf field 2: last_ack_seq
+	}
 	req := protocol.Envelope{
 		Version:     protocol.CurrentVersion,
 		MessageType: protocol.MessageTypeResumeRequest,
 		RequestID:   "resume",
-		Payload:     protocol.MarshalResumeRequest(protocol.ResumeRequest{ResumeToken: token}),
+		Payload:     payload,
 	}
 	if err := c.WriteBinary(protocol.Marshal(req)); err != nil {
 		t.Fatal(err)
@@ -1222,6 +1230,36 @@ func TestResumeReplaysReliablePendingInOriginalSequence(t *testing.T) {
 	}
 }
 
+func TestResumeAppliesClientLastAckBeforeReplayingPending(t *testing.T) {
+	cfg := config.Default()
+	cfg.SessionGracePeriod = time.Second
+	cfg.ReliableRetryInterval = time.Second
+	gw, url := setupReliableRecoveryServer(t, cfg)
+
+	oldConn := dial(t, url)
+	authResult := sendAuth(t, oldConn, "valid")
+	writeEnvelope(t, oldConn, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "first"})
+	first := readEnvelope(t, oldConn)
+	writeEnvelope(t, oldConn, protocol.Envelope{Version: 1, MessageType: 1001, RequestID: "second"})
+	second := readEnvelope(t, oldConn)
+	_ = oldConn.WriteClose()
+	_ = oldConn.Close()
+	waitFor(t, time.Second, func() bool { return gw.ConnectionCount() == 0 })
+
+	newConn := dial(t, url)
+	defer newConn.Close()
+	if result := sendResumeWithLastAck(t, newConn, authResult.ResumeToken, first.Seq); !result.OK {
+		t.Fatalf("resume=%#v", result)
+	}
+	replayed := readEnvelopeWithin(t, newConn, 250*time.Millisecond)
+	if !reflect.DeepEqual(replayed, second) {
+		t.Fatalf("replayed=%#v second=%#v", replayed, second)
+	}
+	if got := gw.ReliablePendingCount(); got != 1 {
+		t.Fatalf("pending=%d", got)
+	}
+}
+
 func TestReliablePendingOverflowClosesConnection(t *testing.T) {
 	cfg := config.Default()
 	cfg.ReliablePendingLimit = 1
@@ -1288,6 +1326,40 @@ func TestResumeSucceedsWhenBackendIsUnavailable(t *testing.T) {
 		t.Fatalf("resume=%#v auth=%#v", resumeResult, authResult)
 	}
 	assertErrorEnvelope(t, sendBusiness(t, resumedConn, 1001, "after-resume", []byte("move")), "backend_unavailable", true)
+}
+
+func TestResumeRestoresRememberedRoomRoute(t *testing.T) {
+	cfg := config.Default()
+	cfg.SessionGracePeriod = time.Second
+	r := routing.NewStaticRouter()
+	r.SetMessageBackend(1001, "room")
+	r.SetUserRoom("alice", "room-1")
+	r.SetRoomInstance("room-1", routing.BackendInstance{ID: "room-a", BackendType: "room", Address: "inproc"})
+	reg := backend.NewRegistry()
+	reg.Set("room-a", fakeBackendClient{handle: func(context.Context, backend.Request) (backend.Response, error) {
+		return backend.Response{MessageType: 1002}, nil
+	}})
+	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}), WithRouter(r), WithBackendRegistry(reg))
+	ts := httptest.NewServer(gw.Handler())
+	defer func() { gw.Close(); ts.Close() }()
+	url := strings.Replace(ts.URL, "http://", "ws://", 1) + "/ws"
+
+	oldConn := dial(t, url)
+	authResult := sendAuth(t, oldConn, "valid")
+	if env := sendBusiness(t, oldConn, 1001, "remember-room", nil); env.MessageType != 1002 {
+		t.Fatalf("env=%#v", env)
+	}
+	_ = oldConn.Close()
+	waitFor(t, time.Second, func() bool { return gw.ConnectionCount() == 0 })
+	r.SetUserRoom("alice", "")
+	reg.Delete("room-a")
+
+	resumedConn := dial(t, url)
+	defer resumedConn.Close()
+	if result := sendResume(t, resumedConn, authResult.ResumeToken); !result.OK {
+		t.Fatalf("resume=%#v", result)
+	}
+	assertErrorEnvelope(t, sendBusiness(t, resumedConn, 1001, "after-resume", nil), "backend_unavailable", true)
 }
 
 func TestConcurrentResumeTokenUseHasOneWinner(t *testing.T) {

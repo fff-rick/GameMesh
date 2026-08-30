@@ -225,3 +225,27 @@ func TestStaticClassifierDefaultsUnreliableAndCanMarkReliable(t *testing.T) {
 		t.Fatalf("1002=%v", got)
 	}
 }
+
+func TestPendingForResumeAppliesCumulativeAckAndPreservesRetryCount(t *testing.T) {
+	base := time.Unix(100, 0)
+	m := NewManager(Config{PendingLimit: 4, DedupWindow: 4, RetryInterval: time.Second, MaxRetries: 2})
+	for i := 0; i < 3; i++ {
+		if _, err := m.TrackOutbound("s1", protocol.Envelope{Version: 1, MessageType: 1002}, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if due, _ := m.CollectDue(base.Add(time.Second)); len(due) != 3 || due[0].RetryCount != 1 {
+		t.Fatalf("due=%#v", due)
+	}
+
+	pending := m.PendingForResume("s1", 1, base.Add(2*time.Second))
+	if len(pending) != 2 || pending[0].Seq != 2 || pending[1].Seq != 3 {
+		t.Fatalf("pending=%#v", pending)
+	}
+	if got := m.LastAckSeq("s1"); got != 1 {
+		t.Fatalf("last_ack=%d", got)
+	}
+	if due, _ := m.CollectDue(base.Add(3 * time.Second)); len(due) != 2 || due[0].RetryCount != 2 {
+		t.Fatalf("due=%#v", due)
+	}
+}

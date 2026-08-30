@@ -282,6 +282,7 @@ func (s *Server) handleBusiness(c *Connection, env protocol.Envelope) {
 		s.sendRoutingError(c, env.RequestID, err)
 		return
 	}
+	s.sessions.SetRoom(c.SessionID(), route.RoomID)
 	client, err := s.backends.Get(route.Instance.ID)
 	if err != nil {
 		s.metrics.BackendRPC(route.BackendType, "Handle", "unavailable", 0)
@@ -417,9 +418,14 @@ func (s *Server) handleResume(c *Connection, env protocol.Envelope) {
 		return
 	}
 	c.bindIdentity(resumed.UserID, resumed.ID)
+	if resumed.RoomID != "" {
+		if binder, ok := s.router.(interface{ SetUserRoom(string, string) }); ok {
+			binder.SetUserRoom(resumed.UserID, resumed.RoomID)
+		}
+	}
 	s.graceSessions.Add(-1)
 	s.updateSessionMetricsLocked()
-	pending := s.reliability.Pending(resumed.ID)
+	pending := s.reliability.PendingForResume(resumed.ID, req.LastAckSeq, time.Now())
 	resumeEnvelope := protocol.Envelope{
 		Version:         protocol.CurrentVersion,
 		MessageType:     protocol.MessageTypeResumeResult,

@@ -19,6 +19,7 @@ type Session struct {
 	ID            string
 	UserID        string
 	ConnID        string
+	RoomID        string
 	CreatedAt     time.Time
 	ResumeToken   string
 	GraceDeadline time.Time
@@ -179,6 +180,27 @@ func (m *Manager) ByUser(userID string) (Session, bool) {
 	defer m.mu.RUnlock()
 	s, ok := m.byUser[userID]
 	return s, ok
+}
+
+// SetRoom records the last successfully resolved room for later in-process
+// routing recovery. It only updates an existing Session.
+func (m *Manager) SetRoom(sessionID, roomID string) bool {
+	if sessionID == "" || roomID == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for userID, s := range m.byUser {
+		if s.ID != sessionID {
+			continue
+		}
+		s.RoomID = roomID
+		m.byUser[userID] = s
+		m.byConn[s.ConnID] = s
+		m.byResumeToken[s.ResumeToken] = s
+		return true
+	}
+	return false
 }
 
 func (m *Manager) ActiveCount() int {

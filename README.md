@@ -95,7 +95,7 @@ ReliableDedupWindow   = 256
 
 ## Stage 5 断线恢复
 
-认证成功会下发 Resume Token。连接断开后，Session 进入默认 1 分钟的 Grace Period；客户端在窗口内通过 `ResumeRequest` 恢复原 Session。恢复成功后服务端会轮换 Token，并按原始 Seq 顺序重放未 ACK 的可靠消息。
+认证成功会下发 Resume Token。连接断开后，Session 进入默认 1 分钟的 Grace Period；客户端在窗口内通过携带 `last_ack_seq` 的 `ResumeRequest` 恢复原 Session。恢复成功后服务端会轮换 Token，先应用累计 ACK，再按原始 Seq 顺序重放未 ACK 的可靠消息。Session 会保留最后一次成功解析的 Room 路由，以恢复 Gateway 内的 `User -> Room` 映射；不会恢复 Backend 游戏状态。
 
 恢复仅适用于同一、仍在运行的 Gateway 进程：不支持 Gateway 重启、跨 Gateway 或跨节点恢复。这些能力属于后续多节点 Gateway 阶段。完整协议与故障边界见 `docs/stage-5/01-断线恢复语义.md`。
 

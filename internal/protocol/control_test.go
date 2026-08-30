@@ -45,7 +45,7 @@ func TestAuthResultRoundTrip(t *testing.T) {
 }
 
 func TestResumeControlPayloadRoundTrip(t *testing.T) {
-	request := ResumeRequest{ResumeToken: "resume-token"}
+	request := ResumeRequest{ResumeToken: "resume-token", LastAckSeq: 42}
 	gotRequest, err := UnmarshalResumeRequest(MarshalResumeRequest(request))
 	if err != nil {
 		t.Fatal(err)
