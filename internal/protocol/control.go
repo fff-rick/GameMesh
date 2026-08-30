@@ -9,10 +9,11 @@ type AuthRequest struct {
 }
 
 type AuthResult struct {
-	OK        bool
-	UserID    string
-	SessionID string
-	ErrorCode string
+	OK          bool
+	UserID      string
+	SessionID   string
+	ResumeToken string
+	ErrorCode   string
 }
 
 func MarshalAuthRequest(v AuthRequest) []byte {
@@ -66,6 +67,9 @@ func MarshalAuthResult(v AuthResult) []byte {
 	if v.ErrorCode != "" {
 		b = appendBytesField(b, 4, []byte(v.ErrorCode))
 	}
+	if v.ResumeToken != "" {
+		b = appendBytesField(b, 5, []byte(v.ResumeToken))
+	}
 	return b
 }
 
@@ -88,7 +92,7 @@ func UnmarshalAuthResult(b []byte) (AuthResult, error) {
 			}
 			out.OK = v != 0
 			b = b[n:]
-		case 2, 3, 4:
+		case 2, 3, 4, 5:
 			if wire != 2 {
 				return AuthResult{}, ErrMalformedControlPayload
 			}
@@ -104,12 +108,141 @@ func UnmarshalAuthResult(b []byte) (AuthResult, error) {
 				out.SessionID = string(v)
 			case 4:
 				out.ErrorCode = string(v)
+			case 5:
+				out.ResumeToken = string(v)
 			}
 		default:
 			var skipped bool
 			b, skipped = skipField(wire, b)
 			if !skipped {
 				return AuthResult{}, ErrMalformedControlPayload
+			}
+		}
+	}
+	return out, nil
+}
+
+type ResumeRequest struct {
+	ResumeToken string
+	LastAckSeq  uint64
+}
+
+func MarshalResumeRequest(v ResumeRequest) []byte {
+	var b []byte
+	if v.ResumeToken != "" {
+		b = appendBytesField(b, 1, []byte(v.ResumeToken))
+	}
+	if v.LastAckSeq != 0 {
+		b = appendVarintField(b, 2, v.LastAckSeq)
+	}
+	return b
+}
+
+func UnmarshalResumeRequest(b []byte) (ResumeRequest, error) {
+	var out ResumeRequest
+	for len(b) > 0 {
+		field, wire, rest, ok := consumeFieldKey(b)
+		if !ok {
+			return ResumeRequest{}, ErrMalformedControlPayload
+		}
+		b = rest
+		switch field {
+		case 1:
+			if wire != 2 {
+				return ResumeRequest{}, ErrMalformedControlPayload
+			}
+			v, rest, ok := consumeBytes(b)
+			if !ok {
+				return ResumeRequest{}, ErrMalformedControlPayload
+			}
+			out.ResumeToken = string(v)
+			b = rest
+		case 2:
+			if wire != 0 {
+				return ResumeRequest{}, ErrMalformedControlPayload
+			}
+			v, n := consumeVarint(b)
+			if n <= 0 {
+				return ResumeRequest{}, ErrMalformedControlPayload
+			}
+			out.LastAckSeq = v
+			b = b[n:]
+		default:
+			var skipped bool
+			b, skipped = skipField(wire, b)
+			if !skipped {
+				return ResumeRequest{}, ErrMalformedControlPayload
+			}
+		}
+	}
+	return out, nil
+}
+
+type ResumeResult struct {
+	OK          bool
+	SessionID   string
+	ResumeToken string
+	ErrorCode   string
+}
+
+func MarshalResumeResult(v ResumeResult) []byte {
+	var b []byte
+	if v.OK {
+		b = appendVarintField(b, 1, 1)
+	}
+	if v.SessionID != "" {
+		b = appendBytesField(b, 2, []byte(v.SessionID))
+	}
+	if v.ResumeToken != "" {
+		b = appendBytesField(b, 3, []byte(v.ResumeToken))
+	}
+	if v.ErrorCode != "" {
+		b = appendBytesField(b, 4, []byte(v.ErrorCode))
+	}
+	return b
+}
+
+func UnmarshalResumeResult(b []byte) (ResumeResult, error) {
+	var out ResumeResult
+	for len(b) > 0 {
+		field, wire, rest, ok := consumeFieldKey(b)
+		if !ok {
+			return ResumeResult{}, ErrMalformedControlPayload
+		}
+		b = rest
+		switch field {
+		case 1:
+			if wire != 0 {
+				return ResumeResult{}, ErrMalformedControlPayload
+			}
+			v, n := consumeVarint(b)
+			if n <= 0 {
+				return ResumeResult{}, ErrMalformedControlPayload
+			}
+			out.OK = v != 0
+			b = b[n:]
+		case 2, 3, 4:
+			if wire != 2 {
+				return ResumeResult{}, ErrMalformedControlPayload
+			}
+			v, rest, ok := consumeBytes(b)
+			if !ok {
+				return ResumeResult{}, ErrMalformedControlPayload
+			}
+			b = rest
+			switch field {
+			case 2:
+				out.SessionID = string(v)
+			case 3:
+				out.ResumeToken = string(v)
+			case 4:
+				out.ErrorCode = string(v)
+			}
+		default:
+			var skipped bool
+			b, skipped = skipField(wire, b)
+			if !skipped {
+				return ResumeResult{}, ErrMalformedControlPayload
 			}
 		}
 	}

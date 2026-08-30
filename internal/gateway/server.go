@@ -55,19 +55,23 @@ func WithReliabilityClassifier(c reliability.Classifier) Option {
 }
 
 type Server struct {
-	cfg       config.Config
-	gatewayID string
-	logger    *slog.Logger
-	metrics   *metrics.Metrics
-	mu        sync.RWMutex
-	conns     map[string]*Connection
-	closing   atomic.Bool
+	cfg         config.Config
+	gatewayID   string
+	logger      *slog.Logger
+	metrics     *metrics.Metrics
+	mu          sync.RWMutex
+	conns       map[string]*Connection
+	closing     atomic.Bool
+	lifecycleMu sync.Mutex
 
 	authenticator auth.Authenticator
 	sessions      *session.Manager
 	unauthRejects atomic.Uint64
+	graceSessions atomic.Int64
 	heartbeatStop chan struct{}
 	heartbeatWG   sync.WaitGroup
+	sessionStop   chan struct{}
+	sessionWG     sync.WaitGroup
 	router        routing.Resolver
 	backends      *backend.Registry
 	backendCaller *backend.Caller
@@ -79,6 +83,9 @@ type Server struct {
 }
 
 func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Option) *Server {
+	if cfg.SessionGracePeriod <= 0 {
+		cfg.SessionGracePeriod = config.DefaultSessionGracePeriod
+	}
 	s := &Server{
 		cfg:                   cfg,
 		gatewayID:             gatewayID,
@@ -86,8 +93,9 @@ func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Optio
 		metrics:               metrics.New(gatewayID),
 		conns:                 make(map[string]*Connection),
 		authenticator:         auth.DevAuthenticator{},
-		sessions:              session.NewManager(),
+		sessions:              session.NewManager(cfg.SessionGracePeriod),
 		heartbeatStop:         make(chan struct{}),
+		sessionStop:           make(chan struct{}),
 		router:                routing.NewStaticRouter(),
 		backends:              backend.NewRegistry(),
 		backendCaller:         backend.NewCaller(cfg.BackendRPCTimeout),
@@ -108,6 +116,8 @@ func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Optio
 		s.reliableWG.Add(1)
 		go s.reliableLoop()
 	}
+	s.sessionWG.Add(1)
+	go s.sessionExpiryLoop()
 	return s
 }
 
@@ -142,6 +152,8 @@ func (s *Server) Close() {
 	s.heartbeatWG.Wait()
 	close(s.reliableStop)
 	s.reliableWG.Wait()
+	close(s.sessionStop)
+	s.sessionWG.Wait()
 	s.mu.RLock()
 	list := make([]*Connection, 0, len(s.conns))
 	for _, c := range s.conns {
@@ -154,6 +166,17 @@ func (s *Server) Close() {
 	for _, c := range list {
 		c.Wait()
 	}
+	s.lifecycleMu.Lock()
+	expired := s.sessions.Expire(time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC))
+	for _, ended := range expired {
+		s.reliability.RemoveSession(ended.ID)
+	}
+	if len(expired) > 0 {
+		s.graceSessions.Add(-int64(len(expired)))
+	}
+	s.metrics.SetReliablePending(s.reliability.PendingCount())
+	s.updateSessionMetricsLocked()
+	s.lifecycleMu.Unlock()
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -176,26 +199,46 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	c := newConnection(id, s.gatewayID, wc, s.cfg.MaxEnvelopeBytes, s.cfg.SendQueueSize, s.cfg.WriteTimeout, s.logger, s.metrics, s.handleEnvelope, s.removeConn)
 	s.mu.Lock()
+	if s.closing.Load() {
+		s.mu.Unlock()
+		_ = wc.Close()
+		return
+	}
 	s.conns[id] = c
 	s.mu.Unlock()
 	c.Start()
 }
 
 func (s *Server) removeConn(c *Connection) {
-	if ended := s.sessions.TerminateByConn(c.ID()); ended != nil {
-		s.reliability.RemoveSession(ended.ID)
-		s.metrics.SetReliablePending(s.reliability.PendingCount())
-		s.metrics.SetActiveSessions(s.sessions.ActiveCount())
-		s.logger.Info("session terminated", "session_id", ended.ID, "user_id", ended.UserID, "conn_id", ended.ConnID)
-	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
 	delete(s.conns, c.ID())
 	s.mu.Unlock()
+
+	if s.closing.Load() {
+		if ended := s.sessions.TerminateByConn(c.ID()); ended != nil {
+			s.reliability.RemoveSession(ended.ID)
+			s.metrics.SetReliablePending(s.reliability.PendingCount())
+			s.updateSessionMetricsLocked()
+			s.logger.Info("session terminated", "session_id", ended.ID, "user_id", ended.UserID, "conn_id", ended.ConnID)
+		}
+		return
+	}
+	if disconnected := s.sessions.Disconnect(c.ID(), time.Now()); disconnected != nil {
+		s.graceSessions.Add(1)
+		s.updateSessionMetricsLocked()
+		s.logger.Info("session entered grace", "session_id", disconnected.ID, "user_id", disconnected.UserID, "conn_id", disconnected.ConnID)
+	}
 }
 
 func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
 	if env.MessageType == protocol.MessageTypeAuthRequest {
 		s.handleAuth(c, env)
+		return
+	}
+	if env.MessageType == protocol.MessageTypeResumeRequest {
+		s.handleResume(c, env)
 		return
 	}
 	if env.MessageType == protocol.MessageTypeAck {
@@ -239,6 +282,7 @@ func (s *Server) handleBusiness(c *Connection, env protocol.Envelope) {
 		s.sendRoutingError(c, env.RequestID, err)
 		return
 	}
+	s.sessions.SetRoom(c.SessionID(), route.RoomID)
 	client, err := s.backends.Get(route.Instance.ID)
 	if err != nil {
 		s.metrics.BackendRPC(route.BackendType, "Handle", "unavailable", 0)
@@ -314,20 +358,93 @@ func (s *Server) handleAuth(c *Connection, env protocol.Envelope) {
 		s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: false, ErrorCode: "invalid_token"})
 		return
 	}
+	s.lifecycleMu.Lock()
+	if s.closing.Load() || !s.currentOpenConnectionLocked(c) {
+		s.lifecycleMu.Unlock()
+		return
+	}
 	current, replaced, err := s.sessions.Register(userID, c.ID())
 	if err != nil {
+		s.lifecycleMu.Unlock()
 		s.metrics.AuthResult("session_create_failed")
 		s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: false, ErrorCode: "session_create_failed"})
 		return
 	}
 	c.bindIdentity(userID, current.ID)
-	s.metrics.SetActiveSessions(s.sessions.ActiveCount())
+	if replaced != nil {
+		s.reliability.RemoveSession(replaced.ID)
+		s.metrics.SetReliablePending(s.reliability.PendingCount())
+		if !replaced.GraceDeadline.IsZero() {
+			s.graceSessions.Add(-1)
+		}
+	}
+	s.updateSessionMetricsLocked()
+	s.lifecycleMu.Unlock()
 	s.metrics.AuthResult("success")
-	s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: true, UserID: userID, SessionID: current.ID})
+	s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: true, UserID: userID, SessionID: current.ID, ResumeToken: current.ResumeToken})
 	if replaced != nil {
 		if old := s.connectionByID(replaced.ConnID); old != nil && old.ID() != c.ID() {
 			old.Close("duplicate_login_replaced")
 		}
+	}
+}
+
+func (s *Server) handleResume(c *Connection, env protocol.Envelope) {
+	if c.Authenticated() {
+		s.metrics.RecoveryResult("already_authenticated")
+		s.sendResumeResult(c, env.RequestID, protocol.ResumeResult{OK: false, ErrorCode: "already_authenticated"})
+		return
+	}
+	req, err := protocol.UnmarshalResumeRequest(env.Payload)
+	if err != nil || req.ResumeToken == "" {
+		s.metrics.RecoveryResult("resume_token_invalid")
+		s.sendResumeResult(c, env.RequestID, protocol.ResumeResult{OK: false, ErrorCode: "resume_token_invalid"})
+		return
+	}
+	s.lifecycleMu.Lock()
+	if s.closing.Load() || !s.currentOpenConnectionLocked(c) {
+		s.lifecycleMu.Unlock()
+		return
+	}
+	resumed, err := s.sessions.Resume(req.ResumeToken, c.ID(), time.Now())
+	if err != nil {
+		s.lifecycleMu.Unlock()
+		code := "resume_failed"
+		if errors.Is(err, session.ErrInvalidResumeToken) || errors.Is(err, session.ErrSessionNotRecoverable) {
+			code = "resume_token_invalid"
+		}
+		s.metrics.RecoveryResult(code)
+		s.sendResumeResult(c, env.RequestID, protocol.ResumeResult{OK: false, ErrorCode: code})
+		return
+	}
+	c.bindIdentity(resumed.UserID, resumed.ID)
+	if resumed.RoomID != "" {
+		if binder, ok := s.router.(interface{ SetUserRoom(string, string) }); ok {
+			binder.SetUserRoom(resumed.UserID, resumed.RoomID)
+		}
+	}
+	s.graceSessions.Add(-1)
+	s.updateSessionMetricsLocked()
+	pending := s.reliability.PendingForResume(resumed.ID, req.LastAckSeq, time.Now())
+	resumeEnvelope := protocol.Envelope{
+		Version:         protocol.CurrentVersion,
+		MessageType:     protocol.MessageTypeResumeResult,
+		RequestID:       env.RequestID,
+		Payload:         protocol.MarshalResumeResult(protocol.ResumeResult{OK: true, SessionID: resumed.ID, ResumeToken: resumed.ResumeToken}),
+		TimestampUnixMS: time.Now().UnixMilli(),
+	}
+	enqueueErr := c.Enqueue(protocol.Marshal(resumeEnvelope))
+	if enqueueErr == nil {
+		for _, replay := range pending {
+			if enqueueErr = c.Enqueue(protocol.Marshal(replay)); enqueueErr != nil {
+				break
+			}
+		}
+	}
+	s.lifecycleMu.Unlock()
+	s.metrics.RecoveryResult("success")
+	if errors.Is(enqueueErr, ErrSendQueueFull) {
+		c.Close("send_queue_full")
 	}
 }
 
@@ -342,9 +459,30 @@ func (s *Server) sendAuthResult(c *Connection, requestID string, result protocol
 	s.sendEnvelope(c, resp)
 }
 
+func (s *Server) sendResumeResult(c *Connection, requestID string, result protocol.ResumeResult) {
+	resp := protocol.Envelope{
+		Version:         protocol.CurrentVersion,
+		MessageType:     protocol.MessageTypeResumeResult,
+		RequestID:       requestID,
+		Payload:         protocol.MarshalResumeResult(result),
+		TimestampUnixMS: time.Now().UnixMilli(),
+	}
+	s.sendEnvelope(c, resp)
+}
+
 func (s *Server) sendEnvelope(c *Connection, env protocol.Envelope) {
 	if c.Authenticated() && s.reliabilityClassifier.Classify(env.MessageType) == reliability.DeliveryReliable {
+		s.lifecycleMu.Lock()
+		current, currentOK := s.sessions.ByConn(c.ID())
+		if s.closing.Load() || !currentOK || current.ID != c.SessionID() || !current.GraceDeadline.IsZero() {
+			s.lifecycleMu.Unlock()
+			return
+		}
 		tracked, err := s.reliability.TrackOutbound(c.SessionID(), env, time.Now())
+		if err == nil {
+			s.metrics.SetReliablePending(s.reliability.PendingCount())
+		}
+		s.lifecycleMu.Unlock()
 		if err != nil {
 			if errors.Is(err, reliability.ErrPendingFull) {
 				s.metrics.ReliablePendingOverflow()
@@ -355,7 +493,6 @@ func (s *Server) sendEnvelope(c *Connection, env protocol.Envelope) {
 			return
 		}
 		env = tracked
-		s.metrics.SetReliablePending(s.reliability.PendingCount())
 	}
 	s.enqueueRawOrClose(c, protocol.Marshal(env))
 }
@@ -370,6 +507,19 @@ func (s *Server) connectionByID(id string) *Connection {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.conns[id]
+}
+
+// currentOpenConnectionLocked reports whether c is still the Gateway's active
+// connection for its ID. lifecycleMu must be held so removeConn cannot delete
+// the map entry between this check and a Session mutation.
+func (s *Server) currentOpenConnectionLocked(c *Connection) bool {
+	if c.State() != ConnOpen {
+		return false
+	}
+	s.mu.RLock()
+	current := s.conns[c.ID()]
+	s.mu.RUnlock()
+	return current == c
 }
 
 func (s *Server) heartbeatLoop() {
@@ -400,6 +550,59 @@ func (s *Server) closeIdleConnections(now time.Time) {
 			}
 		}
 	}
+}
+
+func (s *Server) sessionExpiryLoop() {
+	defer s.sessionWG.Done()
+	ticker := time.NewTicker(sessionExpiryInterval(s.cfg.SessionGracePeriod))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.sessionStop:
+			return
+		case now := <-ticker.C:
+			s.expireSessions(now)
+		}
+	}
+}
+
+func sessionExpiryInterval(gracePeriod time.Duration) time.Duration {
+	interval := gracePeriod / 4
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	if interval > time.Second {
+		interval = time.Second
+	}
+	return interval
+}
+
+func (s *Server) expireSessions(now time.Time) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	expired := s.sessions.Expire(now)
+	if len(expired) == 0 {
+		return
+	}
+	for _, ended := range expired {
+		s.reliability.RemoveSession(ended.ID)
+		s.metrics.GraceExpired()
+	}
+	s.graceSessions.Add(-int64(len(expired)))
+	s.metrics.SetReliablePending(s.reliability.PendingCount())
+	s.updateSessionMetricsLocked()
+}
+
+func (s *Server) updateSessionMetricsLocked() {
+	grace := s.graceSessions.Load()
+	if grace < 0 {
+		grace = 0
+	}
+	active := int64(s.sessions.ActiveCount()) - grace
+	if active < 0 {
+		active = 0
+	}
+	s.metrics.SetSessionCounts(int(active), int(grace))
 }
 
 func (s *Server) acceptReliableInbound(c *Connection, env protocol.Envelope) bool {
@@ -459,22 +662,50 @@ func (s *Server) reliableLoop() {
 		case <-s.reliableStop:
 			return
 		case now := <-ticker.C:
-			due, exhausted := s.reliability.CollectDue(now)
+			s.lifecycleMu.Lock()
+			s.mu.RLock()
+			active := make(map[string]*Connection)
+			for _, c := range s.conns {
+				if !c.Authenticated() || c.State() != ConnOpen {
+					continue
+				}
+				current, ok := s.sessions.ByConn(c.ID())
+				if ok && current.ID == c.SessionID() && current.GraceDeadline.IsZero() {
+					active[current.ID] = c
+				}
+			}
+			s.mu.RUnlock()
+			activeSessionIDs := make([]string, 0, len(active))
+			for sessionID := range active {
+				activeSessionIDs = append(activeSessionIDs, sessionID)
+			}
+			due, exhausted := s.reliability.CollectDueForSessions(now, activeSessionIDs)
 			s.metrics.SetReliablePending(s.reliability.PendingCount())
+			var closeFull []*Connection
 			for _, item := range due {
 				if !s.reliability.IsPending(item.SessionID, item.Envelope.Seq) {
 					continue
 				}
-				if c := s.connectionBySessionID(item.SessionID); c != nil {
+				if c := active[item.SessionID]; c != nil {
 					s.metrics.ReliableRetry()
-					s.enqueueRawOrClose(c, protocol.Marshal(item.Envelope))
+					if err := c.Enqueue(protocol.Marshal(item.Envelope)); errors.Is(err, ErrSendQueueFull) {
+						closeFull = append(closeFull, c)
+					}
 				}
 			}
+			var closeExhausted []*Connection
 			for _, item := range exhausted {
 				s.metrics.ReliableRetryExhausted()
-				if c := s.connectionBySessionID(item.SessionID); c != nil {
-					c.Close("reliable_retry_exhausted")
+				if c := active[item.SessionID]; c != nil {
+					closeExhausted = append(closeExhausted, c)
 				}
+			}
+			s.lifecycleMu.Unlock()
+			for _, c := range closeFull {
+				c.Close("send_queue_full")
+			}
+			for _, c := range closeExhausted {
+				c.Close("reliable_retry_exhausted")
 			}
 		}
 	}

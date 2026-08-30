@@ -71,6 +71,30 @@ func TestTrackOutboundAndCumulativeAck(t *testing.T) {
 	}
 }
 
+func TestPendingReturnsClonedEnvelopesInSequenceOrder(t *testing.T) {
+	base := time.Unix(100, 0)
+	m := NewManager(Config{PendingLimit: 4, DedupWindow: 4, RetryInterval: time.Second, MaxRetries: 2})
+	first, err := m.TrackOutbound("s1", protocol.Envelope{Version: 1, MessageType: 1002, RequestID: "first", Payload: []byte("one")}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.TrackOutbound("s1", protocol.Envelope{Version: 1, MessageType: 1002, RequestID: "second", Payload: []byte("two")}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pending := m.Pending("s1")
+	if len(pending) != 2 || pending[0].Seq != first.Seq || pending[1].Seq != second.Seq {
+		t.Fatalf("pending=%#v", pending)
+	}
+	pending[0].Payload[0] = 'X'
+
+	fresh := m.Pending("s1")
+	if got := string(fresh[0].Payload); got != "one" {
+		t.Fatalf("fresh payload=%q", got)
+	}
+}
+
 func TestPendingLimitIsStrict(t *testing.T) {
 	m := NewManager(Config{PendingLimit: 1, DedupWindow: 4, RetryInterval: time.Second, MaxRetries: 2})
 	if _, err := m.TrackOutbound("s1", protocol.Envelope{Version: 1, MessageType: 1002}, time.Now()); err != nil {
@@ -102,6 +126,30 @@ func TestCollectDueRetriesThenExhausts(t *testing.T) {
 	}
 	if got := m.PendingCount(); got != 0 {
 		t.Fatalf("pending=%d", got)
+	}
+}
+
+func TestCollectDueDoesNotConsumeRetriesWhileSessionIsDisconnected(t *testing.T) {
+	base := time.Unix(100, 0)
+	m := NewManager(Config{PendingLimit: 4, DedupWindow: 4, RetryInterval: time.Second, MaxRetries: 1})
+	tracked, err := m.TrackOutbound("s1", protocol.Envelope{Version: 1, MessageType: 1002, RequestID: "original", Payload: []byte("payload")}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		due, exhausted := m.CollectDueForSessions(base.Add(time.Duration(i)*time.Second), nil)
+		if len(due) != 0 || len(exhausted) != 0 {
+			t.Fatalf("disconnected scan %d: due=%#v exhausted=%#v", i, due, exhausted)
+		}
+	}
+	if got := m.PendingCount(); got != 1 {
+		t.Fatalf("pending while disconnected=%d", got)
+	}
+
+	due, exhausted := m.CollectDueForSessions(base.Add(4*time.Second), []string{"s1"})
+	if len(due) != 1 || len(exhausted) != 0 || due[0].RetryCount != 1 || due[0].Envelope.MessageID != tracked.MessageID || due[0].Envelope.Seq != tracked.Seq {
+		t.Fatalf("due=%#v exhausted=%#v tracked=%#v", due, exhausted, tracked)
 	}
 }
 
@@ -175,5 +223,29 @@ func TestStaticClassifierDefaultsUnreliableAndCanMarkReliable(t *testing.T) {
 	}
 	if got := c.Classify(1002); got != DeliveryReliable {
 		t.Fatalf("1002=%v", got)
+	}
+}
+
+func TestPendingForResumeAppliesCumulativeAckAndPreservesRetryCount(t *testing.T) {
+	base := time.Unix(100, 0)
+	m := NewManager(Config{PendingLimit: 4, DedupWindow: 4, RetryInterval: time.Second, MaxRetries: 2})
+	for i := 0; i < 3; i++ {
+		if _, err := m.TrackOutbound("s1", protocol.Envelope{Version: 1, MessageType: 1002}, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if due, _ := m.CollectDue(base.Add(time.Second)); len(due) != 3 || due[0].RetryCount != 1 {
+		t.Fatalf("due=%#v", due)
+	}
+
+	pending := m.PendingForResume("s1", 1, base.Add(2*time.Second))
+	if len(pending) != 2 || pending[0].Seq != 2 || pending[1].Seq != 3 {
+		t.Fatalf("pending=%#v", pending)
+	}
+	if got := m.LastAckSeq("s1"); got != 1 {
+		t.Fatalf("last_ack=%d", got)
+	}
+	if due, _ := m.CollectDue(base.Add(3 * time.Second)); len(due) != 2 || due[0].RetryCount != 2 {
+		t.Fatalf("due=%#v", due)
 	}
 }

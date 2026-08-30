@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -90,6 +91,7 @@ type pendingEntry struct {
 	RetryCount int
 }
 type sessionState struct {
+	lastAckSeq    uint64
 	lastRecvSeq   uint64
 	nextSendSeq   uint64
 	sendExhausted bool
@@ -254,6 +256,13 @@ func (m *Manager) Ack(sessionID string, ack uint64) int {
 	if st == nil {
 		return 0
 	}
+	return ackLocked(st, ack)
+}
+
+func ackLocked(st *sessionState, ack uint64) int {
+	if ack > st.lastAckSeq {
+		st.lastAckSeq = ack
+	}
 	removed := 0
 	for seq := range st.pending {
 		if seq <= ack {
@@ -264,26 +273,94 @@ func (m *Manager) Ack(sessionID string, ack uint64) int {
 	return removed
 }
 
+func (m *Manager) LastAckSeq(sessionID string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if st := m.sessions[sessionID]; st != nil {
+		return st.lastAckSeq
+	}
+	return 0
+}
+
 func (m *Manager) CollectDue(now time.Time) (due []Retransmission, exhausted []Retransmission) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for sessionID, st := range m.sessions {
-		for seq, p := range st.pending {
-			if now.Before(p.NextRetry) {
-				continue
-			}
-			if p.RetryCount >= m.cfg.MaxRetries {
-				exhausted = append(exhausted, Retransmission{SessionID: sessionID, Envelope: cloneEnvelope(p.Envelope), RetryCount: p.RetryCount})
-				delete(st.pending, seq)
-				continue
-			}
-			p.RetryCount++
-			p.NextRetry = now.Add(m.cfg.RetryInterval)
-			st.pending[seq] = p
-			due = append(due, Retransmission{SessionID: sessionID, Envelope: cloneEnvelope(p.Envelope), RetryCount: p.RetryCount})
+		due, exhausted = m.collectDueLocked(sessionID, st, now, due, exhausted)
+	}
+	return due, exhausted
+}
+
+func (m *Manager) CollectDueForSessions(now time.Time, sessionIDs []string) (due []Retransmission, exhausted []Retransmission) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := make(map[string]struct{}, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if _, ok := seen[sessionID]; ok {
+			continue
+		}
+		seen[sessionID] = struct{}{}
+		if st := m.sessions[sessionID]; st != nil {
+			due, exhausted = m.collectDueLocked(sessionID, st, now, due, exhausted)
 		}
 	}
 	return due, exhausted
+}
+
+func (m *Manager) collectDueLocked(sessionID string, st *sessionState, now time.Time, due, exhausted []Retransmission) ([]Retransmission, []Retransmission) {
+	for seq, p := range st.pending {
+		if now.Before(p.NextRetry) {
+			continue
+		}
+		if p.RetryCount >= m.cfg.MaxRetries {
+			exhausted = append(exhausted, Retransmission{SessionID: sessionID, Envelope: cloneEnvelope(p.Envelope), RetryCount: p.RetryCount})
+			delete(st.pending, seq)
+			continue
+		}
+		p.RetryCount++
+		p.NextRetry = now.Add(m.cfg.RetryInterval)
+		st.pending[seq] = p
+		due = append(due, Retransmission{SessionID: sessionID, Envelope: cloneEnvelope(p.Envelope), RetryCount: p.RetryCount})
+	}
+	return due, exhausted
+}
+
+func (m *Manager) Pending(sessionID string) []protocol.Envelope {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.sessions[sessionID]
+	if st == nil {
+		return nil
+	}
+	return pendingSnapshotLocked(st)
+}
+
+// PendingForResume applies the client's cumulative ACK, refreshes retry timers
+// without resetting retry counts, then returns the remaining envelopes by Seq.
+func (m *Manager) PendingForResume(sessionID string, lastAckSeq uint64, now time.Time) []protocol.Envelope {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.sessions[sessionID]
+	if st == nil {
+		return nil
+	}
+	if lastAckSeq != 0 {
+		ackLocked(st, lastAckSeq)
+	}
+	for seq, entry := range st.pending {
+		entry.NextRetry = now.Add(m.cfg.RetryInterval)
+		st.pending[seq] = entry
+	}
+	return pendingSnapshotLocked(st)
+}
+
+func pendingSnapshotLocked(st *sessionState) []protocol.Envelope {
+	pending := make([]protocol.Envelope, 0, len(st.pending))
+	for _, entry := range st.pending {
+		pending = append(pending, cloneEnvelope(entry.Envelope))
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].Seq < pending[j].Seq })
+	return pending
 }
 
 func (m *Manager) PendingCount() int {

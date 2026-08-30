@@ -13,6 +13,8 @@ enum MessageType {
   MESSAGE_TYPE_HEARTBEAT_RESPONSE = 13;
   MESSAGE_TYPE_ERROR = 14;
   MESSAGE_TYPE_ACK = 15;
+  MESSAGE_TYPE_RESUME_REQUEST = 16;
+  MESSAGE_TYPE_RESUME_RESULT = 17;
 }
 
 message Envelope {
@@ -34,6 +36,19 @@ message AuthResult {
   bool ok = 1;
   string user_id = 2;
   string session_id = 3;
+  string error_code = 4;
+  string resume_token = 5;
+}
+
+message ResumeRequest {
+  string resume_token = 1;
+  uint64 last_ack_seq = 2;
+}
+
+message ResumeResult {
+  bool ok = 1;
+  string session_id = 2;
+  string resume_token = 3;
   string error_code = 4;
 }
 
