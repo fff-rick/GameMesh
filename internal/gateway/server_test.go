@@ -394,6 +394,70 @@ func TestOldConnectionCloseCannotRemoveResumedSession(t *testing.T) {
 	sendHeartbeat(t, newClient)
 }
 
+func TestClosedResumeCandidateCannotConsumeToken(t *testing.T) {
+	cfg := config.Default()
+	cfg.SessionGracePeriod = time.Second
+	gw := New(cfg, "test-gateway", testLogger())
+	defer gw.Close()
+
+	oldTransport := newBlockingTransport()
+	oldConn := newConnection("old", "test-gateway", oldTransport, cfg.MaxEnvelopeBytes, cfg.SendQueueSize, cfg.WriteTimeout, testLogger(), gw.metrics, gw.handleEnvelope, gw.removeConn)
+	gw.mu.Lock()
+	gw.conns[oldConn.ID()] = oldConn
+	gw.mu.Unlock()
+	oldConn.Start()
+	active, _, err := gw.sessions.Register("alice", oldConn.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldConn.bindIdentity(active.UserID, active.ID)
+	oldConn.Close("test_disconnect")
+	oldConn.Wait()
+
+	candidateTransport := newBlockingTransport()
+	candidate := newConnection("closed-candidate", "test-gateway", candidateTransport, cfg.MaxEnvelopeBytes, cfg.SendQueueSize, cfg.WriteTimeout, testLogger(), gw.metrics, gw.handleEnvelope, gw.removeConn)
+	gw.mu.Lock()
+	gw.conns[candidate.ID()] = candidate
+	gw.mu.Unlock()
+	candidate.Start()
+	candidate.Close("test_closed_before_resume")
+	candidate.Wait()
+	if got := gw.connectionByID(candidate.ID()); got != nil {
+		t.Fatalf("closed candidate remained registered: %p", got)
+	}
+
+	gw.handleResume(candidate, protocol.Envelope{
+		Version:     protocol.CurrentVersion,
+		MessageType: protocol.MessageTypeResumeRequest,
+		RequestID:   "closed-candidate-resume",
+		Payload:     protocol.MarshalResumeRequest(protocol.ResumeRequest{ResumeToken: active.ResumeToken}),
+	})
+
+	liveTransport := newBlockingTransport()
+	live := newConnection("live", "test-gateway", liveTransport, cfg.MaxEnvelopeBytes, cfg.SendQueueSize, cfg.WriteTimeout, testLogger(), gw.metrics, gw.handleEnvelope, gw.removeConn)
+	gw.mu.Lock()
+	gw.conns[live.ID()] = live
+	gw.mu.Unlock()
+	live.Start()
+	gw.handleResume(live, protocol.Envelope{
+		Version:     protocol.CurrentVersion,
+		MessageType: protocol.MessageTypeResumeRequest,
+		RequestID:   "live-resume",
+		Payload:     protocol.MarshalResumeRequest(protocol.ResumeRequest{ResumeToken: active.ResumeToken}),
+	})
+
+	if candidate.Authenticated() {
+		t.Fatal("closed candidate was authenticated")
+	}
+	if _, ok := gw.sessions.ByConn(candidate.ID()); ok {
+		t.Fatal("closed candidate retained an orphaned session")
+	}
+	resumed, ok := gw.sessions.ByConn(live.ID())
+	if !ok || resumed.ID != active.ID || !live.Authenticated() {
+		t.Fatalf("live connection did not resume original session: session=%#v found=%t", resumed, ok)
+	}
+}
+
 func TestAuthenticatedResumeRequestIsRejected(t *testing.T) {
 	cfg := config.Default()
 	gw := New(cfg, "test-gateway", testLogger(), WithAuthenticator(tokenAuthenticator{"valid": "alice"}))

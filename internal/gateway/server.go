@@ -358,7 +358,7 @@ func (s *Server) handleAuth(c *Connection, env protocol.Envelope) {
 		return
 	}
 	s.lifecycleMu.Lock()
-	if s.closing.Load() {
+	if s.closing.Load() || !s.currentOpenConnectionLocked(c) {
 		s.lifecycleMu.Unlock()
 		return
 	}
@@ -401,7 +401,7 @@ func (s *Server) handleResume(c *Connection, env protocol.Envelope) {
 		return
 	}
 	s.lifecycleMu.Lock()
-	if s.closing.Load() {
+	if s.closing.Load() || !s.currentOpenConnectionLocked(c) {
 		s.lifecycleMu.Unlock()
 		return
 	}
@@ -501,6 +501,19 @@ func (s *Server) connectionByID(id string) *Connection {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.conns[id]
+}
+
+// currentOpenConnectionLocked reports whether c is still the Gateway's active
+// connection for its ID. lifecycleMu must be held so removeConn cannot delete
+// the map entry between this check and a Session mutation.
+func (s *Server) currentOpenConnectionLocked(c *Connection) bool {
+	if c.State() != ConnOpen {
+		return false
+	}
+	s.mu.RLock()
+	current := s.conns[c.ID()]
+	s.mu.RUnlock()
+	return current == c
 }
 
 func (s *Server) heartbeatLoop() {
