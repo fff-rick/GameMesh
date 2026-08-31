@@ -9,11 +9,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 var (
 	ErrConnectionClosed = errors.New("connection closed")
 	ErrSendQueueFull    = errors.New("send queue full")
+	ErrSendQueueDropped = errors.New("send queue dropped")
 )
 
 type transport interface {
@@ -50,14 +53,18 @@ type Connection struct {
 	identityMu       sync.RWMutex
 	userID           string
 	sessionID        string
+	inboundLimiter   *rate.Limiter
 }
 
-func newConnection(id, gatewayID string, tr transport, maxBytes int64, queueSize int, writeTimeout time.Duration, logger *slog.Logger, m *metrics.Metrics, onEnvelope func(*Connection, protocol.Envelope), onClosed func(*Connection)) *Connection {
+func newConnection(id, gatewayID string, tr transport, maxBytes int64, queueSize int, writeTimeout time.Duration, logger *slog.Logger, m *metrics.Metrics, onEnvelope func(*Connection, protocol.Envelope), onClosed func(*Connection), limiters ...*rate.Limiter) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Connection{id: id, gatewayID: gatewayID, transport: tr, maxEnvelopeBytes: maxBytes, writeTimeout: writeTimeout, sendQ: make(chan []byte, queueSize), logger: logger.With("conn_id", id), metrics: m, onEnvelope: onEnvelope, onClosed: onClosed, ctx: ctx, cancel: cancel}
 	c.state.Store(uint32(ConnNew))
 	c.lastSeenUnixNano.Store(time.Now().UnixNano())
 	c.wg.Add(2)
+	if len(limiters) > 0 {
+		c.inboundLimiter = limiters[0]
+	}
 	return c
 }
 func (c *Connection) ID() string        { return c.id }
@@ -99,6 +106,12 @@ func (c *Connection) Start() {
 	go c.writeLoop()
 }
 func (c *Connection) Enqueue(data []byte) error {
+	return c.enqueue(data, false)
+}
+func (c *Connection) EnqueueDroppable(data []byte) error {
+	return c.enqueue(data, true)
+}
+func (c *Connection) enqueue(data []byte, dropIfFull bool) error {
 	if c.State() != ConnOpen {
 		return ErrConnectionClosed
 	}
@@ -108,6 +121,9 @@ func (c *Connection) Enqueue(data []byte) error {
 		c.metrics.ObserveQueueDepth(len(c.sendQ))
 		return nil
 	default:
+		if dropIfFull {
+			return ErrSendQueueDropped
+		}
 		return ErrSendQueueFull
 	}
 }
@@ -149,6 +165,10 @@ func (c *Connection) readLoop() {
 			continue
 		}
 		c.touch()
+		if c.inboundLimiter != nil && !c.inboundLimiter.Allow() {
+			c.metrics.RateLimited("connection")
+			continue
+		}
 		if c.onEnvelope != nil {
 			c.onEnvelope(c, env)
 		}

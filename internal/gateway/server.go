@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"game-gateway/internal/backend"
 	"game-gateway/internal/config"
 	"game-gateway/internal/metrics"
+	"game-gateway/internal/presence"
 	"game-gateway/internal/protocol"
 	"game-gateway/internal/reliability"
 	"game-gateway/internal/routing"
@@ -18,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 type Option func(*Server)
@@ -54,6 +58,12 @@ func WithReliabilityClassifier(c reliability.Classifier) Option {
 	}
 }
 
+// WithPresenceRegistry enables Stage 6 distributed user ownership. Leaving it
+// unset preserves the Stage 5 single-node behaviour.
+func WithPresenceRegistry(r presence.Registry) Option {
+	return func(s *Server) { s.presence = r }
+}
+
 type Server struct {
 	cfg         config.Config
 	gatewayID   string
@@ -62,6 +72,7 @@ type Server struct {
 	mu          sync.RWMutex
 	conns       map[string]*Connection
 	closing     atomic.Bool
+	draining    atomic.Bool
 	lifecycleMu sync.Mutex
 
 	authenticator auth.Authenticator
@@ -80,11 +91,32 @@ type Server struct {
 	reliability           *reliability.Manager
 	reliableStop          chan struct{}
 	reliableWG            sync.WaitGroup
+	presence              presence.Registry
+	presenceStop          chan struct{}
+	presenceWG            sync.WaitGroup
+	leases                map[string]presence.Owner // conn ID -> current fenced lease; lifecycleMu protected
+	inboundLimiter        *rate.Limiter
+	backendSlots          chan struct{}
 }
 
 func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Option) *Server {
 	if cfg.SessionGracePeriod <= 0 {
 		cfg.SessionGracePeriod = config.DefaultSessionGracePeriod
+	}
+	if cfg.ConnectionRate <= 0 {
+		cfg.ConnectionRate = config.DefaultConnectionRate
+	}
+	if cfg.ConnectionRateBurst <= 0 {
+		cfg.ConnectionRateBurst = config.DefaultConnectionBurst
+	}
+	if cfg.GlobalRate <= 0 {
+		cfg.GlobalRate = config.DefaultGlobalRate
+	}
+	if cfg.GlobalRateBurst <= 0 {
+		cfg.GlobalRateBurst = config.DefaultGlobalBurst
+	}
+	if cfg.BackendMaxInFlight <= 0 {
+		cfg.BackendMaxInFlight = config.DefaultBackendMaxInFlight
 	}
 	s := &Server{
 		cfg:                   cfg,
@@ -103,7 +135,11 @@ func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Optio
 		reliability: reliability.NewManager(reliability.Config{
 			PendingLimit: cfg.ReliablePendingLimit, DedupWindow: cfg.ReliableDedupWindow, RetryInterval: cfg.ReliableRetryInterval, MaxRetries: cfg.ReliableMaxRetries,
 		}),
-		reliableStop: make(chan struct{}),
+		reliableStop:   make(chan struct{}),
+		presenceStop:   make(chan struct{}),
+		leases:         make(map[string]presence.Owner),
+		inboundLimiter: rate.NewLimiter(rate.Limit(cfg.GlobalRate), cfg.GlobalRateBurst),
+		backendSlots:   make(chan struct{}, cfg.BackendMaxInFlight),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -118,6 +154,11 @@ func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Optio
 	}
 	s.sessionWG.Add(1)
 	go s.sessionExpiryLoop()
+	if s.presence != nil {
+		s.presenceWG.Add(2)
+		go s.presenceRenewLoop()
+		go s.presenceSubscriptionLoop()
+	}
 	return s
 }
 
@@ -154,6 +195,8 @@ func (s *Server) Close() {
 	s.reliableWG.Wait()
 	close(s.sessionStop)
 	s.sessionWG.Wait()
+	close(s.presenceStop)
+	s.presenceWG.Wait()
 	s.mu.RLock()
 	list := make([]*Connection, 0, len(s.conns))
 	for _, c := range s.conns {
@@ -179,8 +222,43 @@ func (s *Server) Close() {
 	s.lifecycleMu.Unlock()
 }
 
-func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+// BeginDrain rejects new upgrades and new business work while allowing work
+// already admitted to finish during Drain.
+func (s *Server) BeginDrain() bool {
 	if s.closing.Load() {
+		return false
+	}
+	if !s.draining.CompareAndSwap(false, true) {
+		return false
+	}
+	s.metrics.Shutdown("drain_started")
+	return true
+}
+
+// Drain waits for existing connections to leave. At ctx expiry it force-closes
+// them and returns the context error; in both cases the Server is terminal.
+func (s *Server) Drain(ctx context.Context) error {
+	s.BeginDrain()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.ConnectionCount() == 0 {
+			s.metrics.Shutdown("drain_completed")
+			s.Close()
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			s.metrics.Shutdown("drain_timeout")
+			s.Close()
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	if s.closing.Load() || s.draining.Load() {
 		http.Error(w, "gateway shutting down", http.StatusServiceUnavailable)
 		return
 	}
@@ -197,7 +275,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		_ = wc.Close()
 		return
 	}
-	c := newConnection(id, s.gatewayID, wc, s.cfg.MaxEnvelopeBytes, s.cfg.SendQueueSize, s.cfg.WriteTimeout, s.logger, s.metrics, s.handleEnvelope, s.removeConn)
+	c := newConnection(id, s.gatewayID, wc, s.cfg.MaxEnvelopeBytes, s.cfg.SendQueueSize, s.cfg.WriteTimeout, s.logger, s.metrics, s.handleEnvelope, s.removeConn, rate.NewLimiter(rate.Limit(s.cfg.ConnectionRate), s.cfg.ConnectionRateBurst))
 	s.mu.Lock()
 	if s.closing.Load() {
 		s.mu.Unlock()
@@ -215,6 +293,11 @@ func (s *Server) removeConn(c *Connection) {
 	s.mu.Lock()
 	delete(s.conns, c.ID())
 	s.mu.Unlock()
+	if lease, ok := s.leases[c.ID()]; ok {
+		delete(s.leases, c.ID())
+		s.metrics.SetPresenceLeases(len(s.leases))
+		s.releaseLease(lease)
+	}
 
 	if s.closing.Load() {
 		if ended := s.sessions.TerminateByConn(c.ID()); ended != nil {
@@ -233,6 +316,10 @@ func (s *Server) removeConn(c *Connection) {
 }
 
 func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
+	if !s.inboundLimiter.Allow() {
+		s.metrics.RateLimited("global")
+		return
+	}
 	if env.MessageType == protocol.MessageTypeAuthRequest {
 		s.handleAuth(c, env)
 		return
@@ -261,6 +348,11 @@ func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
 		return
 	}
 	if env.MessageType >= protocol.BusinessMessageMin {
+		if s.draining.Load() {
+			s.metrics.Shutdown("business_rejected_draining")
+			s.sendError(c, env.RequestID, "server_draining", true)
+			return
+		}
 		if s.reliabilityClassifier.Classify(env.MessageType) == reliability.DeliveryReliable {
 			if !s.acceptReliableInbound(c, env) {
 				return
@@ -287,6 +379,14 @@ func (s *Server) handleBusiness(c *Connection, env protocol.Envelope) {
 	if err != nil {
 		s.metrics.BackendRPC(route.BackendType, "Handle", "unavailable", 0)
 		s.sendError(c, env.RequestID, "backend_unavailable", true)
+		return
+	}
+	select {
+	case s.backendSlots <- struct{}{}:
+		defer func() { <-s.backendSlots }()
+	default:
+		s.metrics.BackendRejected()
+		s.sendError(c, env.RequestID, "backend_overloaded", true)
 		return
 	}
 	started := time.Now()
@@ -363,14 +463,29 @@ func (s *Server) handleAuth(c *Connection, env protocol.Envelope) {
 		s.lifecycleMu.Unlock()
 		return
 	}
+	lease, previous, err := s.claimLease(c, userID)
+	if err != nil {
+		s.lifecycleMu.Unlock()
+		s.metrics.Presence("claim_error")
+		s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: false, ErrorCode: "presence_unavailable"})
+		return
+	}
 	current, replaced, err := s.sessions.Register(userID, c.ID())
 	if err != nil {
+		if lease != nil {
+			s.releaseLease(*lease)
+		}
 		s.lifecycleMu.Unlock()
 		s.metrics.AuthResult("session_create_failed")
 		s.sendAuthResult(c, env.RequestID, protocol.AuthResult{OK: false, ErrorCode: "session_create_failed"})
 		return
 	}
 	c.bindIdentity(userID, current.ID)
+	if lease != nil {
+		s.leases[c.ID()] = *lease
+		s.metrics.SetPresenceLeases(len(s.leases))
+		s.metrics.Presence("claim_success")
+	}
 	if replaced != nil {
 		s.reliability.RemoveSession(replaced.ID)
 		s.metrics.SetReliablePending(s.reliability.PendingCount())
@@ -386,6 +501,9 @@ func (s *Server) handleAuth(c *Connection, env protocol.Envelope) {
 		if old := s.connectionByID(replaced.ConnID); old != nil && old.ID() != c.ID() {
 			old.Close("duplicate_login_replaced")
 		}
+	}
+	if previous != nil && previous.GatewayID != s.gatewayID {
+		go s.publishEviction(*previous)
 	}
 }
 
@@ -406,8 +524,28 @@ func (s *Server) handleResume(c *Connection, env protocol.Envelope) {
 		s.lifecycleMu.Unlock()
 		return
 	}
+	// Resume remains local, but it must reacquire distributed ownership because
+	// the old connection released its lease when it entered the grace period.
+	userID, ok := s.resumeUserID(req.ResumeToken)
+	if !ok {
+		s.lifecycleMu.Unlock()
+		s.metrics.RecoveryResult("resume_token_invalid")
+		s.sendResumeResult(c, env.RequestID, protocol.ResumeResult{OK: false, ErrorCode: "resume_token_invalid"})
+		return
+	}
+	lease, previous, claimErr := s.claimLease(c, userID)
+	if claimErr != nil {
+		s.lifecycleMu.Unlock()
+		s.metrics.Presence("claim_error")
+		s.metrics.RecoveryResult("presence_unavailable")
+		s.sendResumeResult(c, env.RequestID, protocol.ResumeResult{OK: false, ErrorCode: "presence_unavailable"})
+		return
+	}
 	resumed, err := s.sessions.Resume(req.ResumeToken, c.ID(), time.Now())
 	if err != nil {
+		if lease != nil {
+			s.releaseLease(*lease)
+		}
 		s.lifecycleMu.Unlock()
 		code := "resume_failed"
 		if errors.Is(err, session.ErrInvalidResumeToken) || errors.Is(err, session.ErrSessionNotRecoverable) {
@@ -418,6 +556,11 @@ func (s *Server) handleResume(c *Connection, env protocol.Envelope) {
 		return
 	}
 	c.bindIdentity(resumed.UserID, resumed.ID)
+	if lease != nil {
+		s.leases[c.ID()] = *lease
+		s.metrics.SetPresenceLeases(len(s.leases))
+		s.metrics.Presence("claim_success")
+	}
 	if resumed.RoomID != "" {
 		if binder, ok := s.router.(interface{ SetUserRoom(string, string) }); ok {
 			binder.SetUserRoom(resumed.UserID, resumed.RoomID)
@@ -446,6 +589,14 @@ func (s *Server) handleResume(c *Connection, env protocol.Envelope) {
 	if errors.Is(enqueueErr, ErrSendQueueFull) {
 		c.Close("send_queue_full")
 	}
+	if previous != nil && previous.GatewayID != s.gatewayID {
+		go s.publishEviction(*previous)
+	}
+}
+
+func (s *Server) resumeUserID(token string) (string, bool) {
+	current, ok := s.sessions.ByResumeToken(token)
+	return current.UserID, ok
 }
 
 func (s *Server) sendAuthResult(c *Connection, requestID string, result protocol.AuthResult) {
@@ -494,11 +645,22 @@ func (s *Server) sendEnvelope(c *Connection, env protocol.Envelope) {
 		}
 		env = tracked
 	}
-	s.enqueueRawOrClose(c, protocol.Marshal(env))
+	droppable := env.MessageType >= protocol.BusinessMessageMin && s.reliabilityClassifier.Classify(env.MessageType) != reliability.DeliveryReliable
+	s.enqueueRaw(c, protocol.Marshal(env), droppable)
 }
 
-func (s *Server) enqueueRawOrClose(c *Connection, data []byte) {
-	if err := c.Enqueue(data); err != nil && errors.Is(err, ErrSendQueueFull) {
+func (s *Server) enqueueRaw(c *Connection, data []byte, droppable bool) {
+	var err error
+	if droppable {
+		err = c.EnqueueDroppable(data)
+	} else {
+		err = c.Enqueue(data)
+	}
+	if errors.Is(err, ErrSendQueueDropped) {
+		s.metrics.MessageDropped()
+		return
+	}
+	if errors.Is(err, ErrSendQueueFull) {
 		c.Close("send_queue_full")
 	}
 }
@@ -603,6 +765,125 @@ func (s *Server) updateSessionMetricsLocked() {
 		active = 0
 	}
 	s.metrics.SetSessionCounts(int(active), int(grace))
+}
+
+func (s *Server) claimLease(c *Connection, userID string) (*presence.Owner, *presence.Owner, error) {
+	if s.presence == nil {
+		return nil, nil, nil
+	}
+	token, err := newID()
+	if err != nil {
+		return nil, nil, err
+	}
+	lease := presence.Owner{UserID: userID, GatewayID: s.gatewayID, ConnID: c.ID(), LeaseToken: token}
+	ctx, cancel := s.presenceContext(c.ctx)
+	defer cancel()
+	previous, err := s.presence.Claim(ctx, lease)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &lease, previous, nil
+}
+
+func (s *Server) releaseLease(lease presence.Owner) {
+	if s.presence == nil {
+		return
+	}
+	ctx, cancel := s.presenceContext(context.Background())
+	defer cancel()
+	_, err := s.presence.Release(ctx, lease)
+	if err != nil {
+		s.metrics.Presence("release_error")
+	} else {
+		s.metrics.Presence("release_success")
+	}
+}
+
+func (s *Server) publishEviction(target presence.Owner) {
+	if s.presence == nil {
+		return
+	}
+	ctx, cancel := s.presenceContext(context.Background())
+	defer cancel()
+	if err := s.presence.PublishEviction(ctx, target); err != nil {
+		s.metrics.Presence("eviction_publish_error")
+	} else {
+		s.metrics.Presence("eviction_published")
+	}
+}
+
+func (s *Server) presenceContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.cfg.PresenceOperationTimeout
+	if timeout <= 0 {
+		timeout = config.DefaultPresenceTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func (s *Server) presenceRenewLoop() {
+	defer s.presenceWG.Done()
+	interval := s.cfg.PresenceRenewInterval
+	if interval <= 0 {
+		interval = config.DefaultPresenceRenewEvery
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.presenceStop:
+			return
+		case <-ticker.C:
+			s.renewLeases()
+		}
+	}
+}
+
+func (s *Server) renewLeases() {
+	s.lifecycleMu.Lock()
+	leases := make([]presence.Owner, 0, len(s.leases))
+	for _, lease := range s.leases {
+		leases = append(leases, lease)
+	}
+	s.lifecycleMu.Unlock()
+	for _, lease := range leases {
+		ctx, cancel := s.presenceContext(context.Background())
+		renewed, err := s.presence.Renew(ctx, lease)
+		cancel()
+		if err != nil {
+			s.metrics.Presence("renew_error")
+			continue
+		}
+		if renewed {
+			s.metrics.Presence("renew_success")
+			continue
+		}
+		s.metrics.Presence("lease_fenced")
+		if c := s.connectionByID(lease.ConnID); c != nil {
+			c.Close("presence_lease_fenced")
+		}
+	}
+}
+
+func (s *Server) presenceSubscriptionLoop() {
+	defer s.presenceWG.Done()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { <-s.presenceStop; cancel() }()
+	for ctx.Err() == nil {
+		err := s.presence.Subscribe(ctx, func(target presence.Owner) {
+			if target.GatewayID != s.gatewayID {
+				return
+			}
+			if c := s.connectionByID(target.ConnID); c != nil {
+				s.metrics.Presence("eviction_received")
+				c.Close("duplicate_login_replaced")
+			}
+		})
+		if err != nil && ctx.Err() == nil {
+			s.metrics.Presence("subscription_error")
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
 }
 
 func (s *Server) acceptReliableInbound(c *Connection, env protocol.Envelope) bool {

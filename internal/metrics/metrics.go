@@ -34,6 +34,12 @@ type Metrics struct {
 	recoveryResults         map[string]uint64
 	backendRPCResults       map[string]uint64
 	backendRPCLatency       map[string]latencyAgg
+	presenceResults         map[string]uint64
+	presenceLeases          atomic.Int64
+	messagesDropped         atomic.Uint64
+	backendRejected         atomic.Uint64
+	rateLimits              map[string]uint64
+	shutdowns               map[string]uint64
 }
 
 type sessionCounts struct {
@@ -42,7 +48,7 @@ type sessionCounts struct {
 }
 
 func New(gatewayID string) *Metrics {
-	m := &Metrics{gatewayID: gatewayID, disconnects: map[string]uint64{}, authResults: map[string]uint64{}, recoveryResults: map[string]uint64{}, backendRPCResults: map[string]uint64{}, backendRPCLatency: map[string]latencyAgg{}}
+	m := &Metrics{gatewayID: gatewayID, disconnects: map[string]uint64{}, authResults: map[string]uint64{}, recoveryResults: map[string]uint64{}, backendRPCResults: map[string]uint64{}, backendRPCLatency: map[string]latencyAgg{}, presenceResults: map[string]uint64{}, rateLimits: map[string]uint64{}, shutdowns: map[string]uint64{}}
 	m.sessionCounts.Store(&sessionCounts{})
 	return m
 }
@@ -95,6 +101,12 @@ func (m *Metrics) RecoveryResult(result string) {
 	m.recoveryResults[result]++
 	m.mu.Unlock()
 }
+func (m *Metrics) Presence(result string)   { m.mu.Lock(); m.presenceResults[result]++; m.mu.Unlock() }
+func (m *Metrics) SetPresenceLeases(n int)  { m.presenceLeases.Store(int64(n)) }
+func (m *Metrics) MessageDropped()          { m.messagesDropped.Add(1) }
+func (m *Metrics) BackendRejected()         { m.backendRejected.Add(1) }
+func (m *Metrics) RateLimited(scope string) { m.mu.Lock(); m.rateLimits[scope]++; m.mu.Unlock() }
+func (m *Metrics) Shutdown(result string)   { m.mu.Lock(); m.shutdowns[result]++; m.mu.Unlock() }
 
 type latencyAgg struct {
 	Count      uint64
@@ -145,6 +157,9 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE game_gateway_reliable_out_of_order_total counter\ngame_gateway_reliable_out_of_order_total{gateway_id=\"%s\"} %d\n", gid, m.reliableOutOfOrder.Load())
 	fmt.Fprintf(w, "# TYPE game_gateway_reliable_retry_exhausted_total counter\ngame_gateway_reliable_retry_exhausted_total{gateway_id=\"%s\"} %d\n", gid, m.reliableRetryExhausted.Load())
 	fmt.Fprintf(w, "# TYPE game_gateway_reliable_pending_overflow_total counter\ngame_gateway_reliable_pending_overflow_total{gateway_id=\"%s\"} %d\n", gid, m.reliablePendingOverflow.Load())
+	fmt.Fprintf(w, "game_gateway_presence_leases{gateway_id=\"%s\"} %d\n", gid, m.presenceLeases.Load())
+	fmt.Fprintf(w, "game_gateway_messages_dropped_total{gateway_id=\"%s\",policy=\"best_effort_queue_full\"} %d\n", gid, m.messagesDropped.Load())
+	fmt.Fprintf(w, "game_gateway_backend_rejected_total{gateway_id=\"%s\",reason=\"in_flight_limit\"} %d\n", gid, m.backendRejected.Load())
 	m.mu.Lock()
 	keys := make([]string, 0, len(m.disconnects))
 	for k := range m.disconnects {
@@ -170,6 +185,30 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 	sort.Strings(recoveryKeys)
 	for _, k := range recoveryKeys {
 		fmt.Fprintf(w, "game_gateway_recovery_total{gateway_id=\"%s\",result=\"%s\"} %d\n", gid, escape(k), m.recoveryResults[k])
+	}
+	presenceKeys := make([]string, 0, len(m.presenceResults))
+	for k := range m.presenceResults {
+		presenceKeys = append(presenceKeys, k)
+	}
+	sort.Strings(presenceKeys)
+	for _, k := range presenceKeys {
+		fmt.Fprintf(w, "game_gateway_presence_operations_total{gateway_id=\"%s\",result=\"%s\"} %d\n", gid, escape(k), m.presenceResults[k])
+	}
+	rateKeys := make([]string, 0, len(m.rateLimits))
+	for k := range m.rateLimits {
+		rateKeys = append(rateKeys, k)
+	}
+	sort.Strings(rateKeys)
+	for _, k := range rateKeys {
+		fmt.Fprintf(w, "game_gateway_rate_limited_total{gateway_id=\"%s\",scope=\"%s\"} %d\n", gid, escape(k), m.rateLimits[k])
+	}
+	shutdownKeys := make([]string, 0, len(m.shutdowns))
+	for k := range m.shutdowns {
+		shutdownKeys = append(shutdownKeys, k)
+	}
+	sort.Strings(shutdownKeys)
+	for _, k := range shutdownKeys {
+		fmt.Fprintf(w, "game_gateway_shutdown_total{gateway_id=\"%s\",result=\"%s\"} %d\n", gid, escape(k), m.shutdowns[k])
 	}
 	rpcKeys := make([]string, 0, len(m.backendRPCResults))
 	for k := range m.backendRPCResults {
