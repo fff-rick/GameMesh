@@ -182,6 +182,15 @@ func (m *Manager) ByUser(userID string) (Session, bool) {
 	return s, ok
 }
 
+// ByResumeToken only exposes the associated local user to the Gateway while it
+// holds its lifecycle lock; callers must still use Resume to consume the token.
+func (m *Manager) ByResumeToken(token string) (Session, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.byResumeToken[token]
+	return s, ok
+}
+
 // SetRoom records the last successfully resolved room for later in-process
 // routing recovery. It only updates an existing Session.
 func (m *Manager) SetRoom(sessionID, roomID string) bool {
