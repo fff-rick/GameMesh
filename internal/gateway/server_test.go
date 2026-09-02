@@ -161,6 +161,16 @@ func TestServerCloseReleasesConnections(t *testing.T) {
 	}
 }
 
+func TestDemoPageIsServedByGateway(t *testing.T) {
+	gw := New(config.Default(), "test-gateway", testLogger())
+	defer gw.Close()
+	recorder := httptest.NewRecorder()
+	gw.Handler().ServeHTTP(recorder, httptest.NewRequest("GET", "/demo/", nil))
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), "GameMesh × GSSS 联动演示") {
+		t.Fatalf("status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
 // blockingTransport simulates a client that never consumes outbound data.
 type blockingTransport struct {
 	unblock chan struct{}

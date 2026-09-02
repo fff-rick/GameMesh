@@ -1,123 +1,178 @@
-# Game Gateway
+# GameMesh
 
-当前完成版本：**Stage 7 — 背压、限流与优雅下线（PASS）**。
+GameMesh 是一个使用 Go 实现的游戏接入层（Game Gateway）。它为游戏客户端提供 WebSocket 长连接接入，并负责认证、会话管理、心跳、消息可靠性、后端路由、跨节点在线归属和优雅下线；游戏规则与权威世界状态仍由后端服务负责。
 
-项目严格按 `docs/03-阶段性任务.md` 顺序开发：Stage 0–7 已完成阶段闭环。Stage 3 的真实 gRPC 集成由项目负责人在外部环境确认通过；Stage 4 已实现 MessageID / Seq / ACK / Pending / Retry / Dedup 和可靠性分类；Stage 5 在单个 Gateway 进程内实现了短暂断线后的 Session 恢复；Stage 6 使用 Redis Lease 协调多 Gateway 用户归属；Stage 7 增加背压、限流与有期限 Drain。
+项目当前已完成 Gateway v1 的阶段性验收（Stage 0–8），可作为独立的 Gateway 示例运行。
 
-## 核心目录
+## 架构与能力
 
 ```text
-game-gateway-stage5/
-├── api/proto/
-│   ├── envelope.proto
-│   └── backend.proto
-├── cmd/
-│   ├── gateway/
-│   └── bench/
-├── internal/
-│   ├── auth/
-│   ├── backend/
-│   ├── config/
-│   ├── gateway/
-│   ├── metrics/
-│   ├── presence/      # Stage 6 Redis User -> Gateway TTL/Lease
-│   ├── protocol/
-│   ├── reliability/   # Stage 4 Seq/ACK/Pending/Retry/Dedup
-│   ├── routing/
-│   ├── session/
-│   └── ws/
-└── docs/
-    ├── stage-0/
-    ├── stage-1/
-    ├── stage-2/
-    ├── stage-3/
-    ├── stage-4/
-    ├── stage-5/
-    ├── stage-6/
-    ├── stage-7/
-    └── superpowers/plans/
+Game Client
+    │ WebSocket + Protobuf Envelope
+    ▼
+GameMesh Gateway
+    ├── 认证、Session、心跳、断线恢复
+    ├── ACK / 重试 / 去重、背压与限流
+    ├── User → Room → Backend 路由
+    └── 可选 Redis 在线归属（多 Gateway）
+    │ gRPC
+    └──────────────► 业务 Backend / Match / Chat
 ```
 
-## 构建与测试
+- **统一协议**：客户端通过二进制 WebSocket 传输 Protobuf `Envelope`；协议定义位于 `api/proto/envelope.proto`。
+- **接入与会话**：内置鉴权接口、心跳与空闲连接回收；重复登录采用 **New Login Wins**。
+- **可靠消息**：支持 `MessageID`、`Seq`、`ACK`、待确认队列、重试和去重窗口。
+- **断线恢复**：认证后签发 Resume Token；默认可在 1 分钟宽限期内恢复同一 Gateway 进程中的 Session。
+- **后端路由**：Gateway 仅转发，不解释业务 Payload；通过 `MessageType → BackendType`、`UserID → RoomID`、`RoomID → BackendInstance` 选择后端。
+- **多节点归属**：可选 Redis Lease 管理 `UserID → GatewayID / ConnID`，支持跨节点重复登录的归属切换。
+- **生产保护**：连接级/全局限流、下游最大并发、慢客户端背压策略，以及 SIGTERM 的有期限 Drain。
+- **可观测性**：提供健康检查与 Prometheus Metrics 端点。
+
+> 重要边界：Resume Token、Session 和可靠消息状态目前不会跨进程迁移。因此断线恢复必须回到原 Gateway，且不支持 Gateway 重启后恢复；它也不会恢复后端的游戏状态。
+
+## 环境要求
+
+- Go **1.25+**
+- 可选：Redis（仅多 Gateway 在线归属场景需要）
+
+## 快速开始
+
+进入项目并下载依赖：
 
 ```bash
-go test ./... -count=1
-go test -race ./... -count=1
-go vet ./...
-go build ./...
+cd /home/xin/work/GameMesh
+go mod download
 ```
 
-## 运行
+启动 Gateway：
 
 ```bash
 go run ./cmd/gateway -listen :8080 -gateway-id gateway-1
 ```
 
-接口：
+服务启动后可访问：
+
+| 地址 | 用途 |
+| --- | --- |
+| `ws://127.0.0.1:8080/ws` | 客户端 WebSocket 接入点（二进制帧） |
+| `http://127.0.0.1:8080/healthz` | 健康检查 |
+| `http://127.0.0.1:8080/metrics` | Prometheus Metrics |
+
+按 `Ctrl+C` 或发送 `SIGTERM` 可触发优雅下线：Gateway 先停止新接入，再等待已接收的请求在默认 10 秒内完成。
+
+## 客户端接入
+
+WebSocket 仅接受 **二进制**帧，帧内容是 Protobuf 编码的 `gamegateway.v1.Envelope`。最小交互流程如下：
 
 ```text
-WebSocket: ws://127.0.0.1:8080/ws
-Health:    http://127.0.0.1:8080/healthz
-Metrics:   http://127.0.0.1:8080/metrics
+Client                       GameMesh
+  │ ── AuthRequest ───────────► │
+  │ ◄─ AuthResult + ResumeToken ─│
+  │ ── Heartbeat / 业务消息 ───► │
+  │ ◄─ 响应 / ACK / 业务下行 ───│
 ```
 
-## Stage 2 鉴权
-
-默认 `DevAuthenticator` 仅用于开发演示，Token 格式为 `user:<UserID>`。生产环境必须通过 `gateway.WithAuthenticator(...)` 注入真实校验器。重复登录策略仍为 **New Login Wins**。
-
-## Stage 3 Backend 路由
-
-Gateway 按：
+开发环境默认鉴权器使用以下 Token 格式：
 
 ```text
-MessageType -> BackendType
-UserID      -> RoomID
-RoomID      -> BackendInstance
+user:<UserID>
 ```
 
-完成下游路由，业务 Payload 不在 Gateway 内解释。gRPC service 契约位于 `api/proto/backend.proto`。
+例如 `user:alice`。生产环境请在构造 Gateway 时通过 `gateway.WithAuthenticator(...)` 注入真实的鉴权实现，勿使用默认开发鉴权器。
 
-## Stage 4 可靠消息
+主要控制消息类型：
 
-新增控制 MessageType：
+| MessageType | 含义 |
+| ---: | --- |
+| 10 / 11 | `AuthRequest` / `AuthResult` |
+| 12 / 13 | `HeartbeatRequest` / `HeartbeatResponse` |
+| 14 | `Error` |
+| 15 | `ACK` |
+| 16 / 17 | `ResumeRequest` / `ResumeResult` |
 
-```text
-15 ACK
-```
+完整字段和编号以 [envelope.proto](api/proto/envelope.proto) 为准。客户端对可靠下行消息应回传 ACK；恢复 Session 时需在 `ResumeRequest` 中携带最新的 `last_ack_seq`。
 
-可靠消息必须显式通过 `reliability.Classifier` 分类。核心默认值：
+## 多 Gateway 模式（可选）
 
-```text
-ReliableRetryInterval = 500ms
-ReliableMaxRetries    = 3
-ReliablePendingLimit  = 128
-ReliableDedupWindow   = 256
-```
-
-语义详见 `docs/stage-4/01-可靠消息语义.md`。Stage 4 只保证当前 Session/Connection 生命周期内的可靠状态；断线恢复 Pending 属于 Stage 5。
-
-## Stage 5 断线恢复
-
-认证成功会下发 Resume Token。连接断开后，Session 进入默认 1 分钟的 Grace Period；客户端在窗口内通过携带 `last_ack_seq` 的 `ResumeRequest` 恢复原 Session。恢复成功后服务端会轮换 Token，先应用累计 ACK，再按原始 Seq 顺序重放未 ACK 的可靠消息。Session 会保留最后一次成功解析的 Room 路由，以恢复 Gateway 内的 `User -> Room` 映射；不会恢复 Backend 游戏状态。
-
-恢复仅适用于同一、仍在运行的 Gateway 进程：不支持 Gateway 重启、跨 Gateway 或跨节点恢复。完整协议与故障边界见 `docs/stage-5/01-断线恢复语义.md`。
-
-## Stage 6 多节点 Gateway
-
-启用 `-presence-redis` 后，Gateway 会将仅有的分布式状态——`UserID -> GatewayID / ConnID`——保存为 Redis 短租约。Claim、Renew 和 Release 均通过 LeaseToken fencing，旧节点的延迟操作不能覆盖新归属；TTL 会在节点崩溃后自动清理。跨节点重复登录执行 **New Login Wins**，并通过 best-effort Pub/Sub 快速关闭旧连接。
-
-Redis 短暂故障不会关闭已有连接；仅新的认证或 Resume 会得到可重试的 `presence_unavailable`。Session、Resume Token 和可靠消息状态仍不跨节点迁移，因此 Resume 仍必须到达原 Gateway。详见 `docs/stage-6/01-多节点语义.md`。
+启动本地 Redis 后，为每个 Gateway 指定不同实例 ID 并连接同一 Redis：
 
 ```bash
-go run ./cmd/gateway -listen :8080 -gateway-id gateway-a -presence-redis 127.0.0.1:6379
+go run ./cmd/gateway \
+  -listen :8080 \
+  -gateway-id gateway-a \
+  -presence-redis 127.0.0.1:6379
 ```
 
-## Stage 7 背压、限流与优雅下线
+Redis 仅保存短租约形式的在线归属。Redis 暂时不可用时，现有连接保持不受影响；新的认证或 Resume 请求会收到可重试的 `presence_unavailable` 错误。
 
-Gateway 对入站采用连接级和全局 token bucket，对下游 RPC 使用无等待的最大在途并发阀门；非可靠业务下行在队列满时可丢弃，可靠与控制消息则关闭慢连接。SIGTERM 会先停止接入并进入 Drain，给已接收请求默认 10 秒完成时间，期满后明确关闭剩余连接。
+## 常用运行参数
 
-完整策略与参数见 `docs/stage-7/01-背压限流与下线语义.md`。
+```bash
+go run ./cmd/gateway -help
+```
 
-## 下一阶段
+常用参数包括：
 
-Stage 8：独立项目最终验收。
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-listen` | `:8080` | HTTP / WebSocket 监听地址 |
+| `-gateway-id` | `gateway-1` | Gateway 实例标识 |
+| `-presence-redis` | 空 | Redis 地址；为空时关闭分布式在线归属 |
+| `-connection-rate` | `1000` | 单连接每秒最大入站 Envelope 数 |
+| `-global-rate` | `20000` | Gateway 全局每秒最大入站 Envelope 数 |
+| `-backend-max-in-flight` | `1024` | 最大并发下游 RPC 数 |
+| `-drain-timeout` | `10s` | 优雅下线最长等待时间 |
+
+## 构建、测试与压测
+
+```bash
+# 单元与集成测试
+go test ./... -count=1
+
+# 竞态检测
+go test -race ./... -count=1
+
+# 静态检查与构建
+go vet ./...
+go build ./...
+
+# 本地 Echo 压测（内嵌测试 Gateway）
+go run ./cmd/bench -clients 50 -messages 100 -payload 256
+```
+
+如需验证 gRPC 路由，可启动 `cmd/fake_backend`：
+
+```bash
+go run ./cmd/fake_backend -listen 127.0.0.1:9091 -mode success
+```
+
+`-mode` 可选 `success`、`delay` 或 `business-error`，用于模拟后端正常响应、超时和业务错误。
+
+## 目录结构
+
+```text
+GameMesh/
+├── api/proto/          # Envelope 与内部 gRPC 协议
+├── cmd/gateway/        # Gateway 可执行程序
+├── cmd/fake_backend/   # 路由联调用 gRPC 后端
+├── cmd/bench/          # 轻量 Echo 压测工具
+├── internal/
+│   ├── auth/           # 鉴权
+│   ├── gateway/        # HTTP/WS 接入与生命周期
+│   ├── session/        # Session、断线恢复
+│   ├── reliability/    # Seq / ACK / Retry / Dedup
+│   ├── routing/        # 用户、房间、后端路由
+│   ├── presence/       # Redis Lease 在线归属
+│   └── metrics/        # Prometheus 指标
+└── docs/               # 设计、阶段任务、验收和测试报告
+```
+
+## 更多文档
+
+- [方案设计](docs/02-方案设计.md)
+- [阶段性任务与验收标准](docs/03-阶段性任务.md)
+- [可靠消息语义](docs/stage-4/01-可靠消息语义.md)
+- [断线恢复语义](docs/stage-5/01-断线恢复语义.md)
+- [多节点 Gateway 语义](docs/stage-6/01-多节点语义.md)
+- [背压、限流与下线语义](docs/stage-7/01-背压限流与下线语义.md)
+- [最终验收文档](docs/stage-8/)
