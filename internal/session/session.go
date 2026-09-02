@@ -191,6 +191,19 @@ func (m *Manager) ByResumeToken(token string) (Session, bool) {
 	return s, ok
 }
 
+// ByID resolves the current connection for an opaque SessionID. Session IDs
+// are intentionally not exposed as external lookup keys.
+func (m *Manager) ByID(id string) (Session, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.byUser {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return Session{}, false
+}
+
 // SetRoom records the last successfully resolved room for later in-process
 // routing recovery. It only updates an existing Session.
 func (m *Manager) SetRoom(sessionID, roomID string) bool {

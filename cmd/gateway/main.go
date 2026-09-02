@@ -6,14 +6,19 @@ import (
 	"game-gateway/internal/config"
 	"game-gateway/internal/gateway"
 	"game-gateway/internal/presence"
+	"game-gateway/internal/routing"
+	"game-gateway/internal/statesync"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
@@ -30,15 +35,55 @@ func main() {
 	flag.IntVar(&cfg.GlobalRateBurst, "global-rate-burst", cfg.GlobalRateBurst, "Gateway-wide inbound burst")
 	flag.IntVar(&cfg.BackendMaxInFlight, "backend-max-in-flight", cfg.BackendMaxInFlight, "maximum concurrent backend RPCs")
 	flag.DurationVar(&cfg.DrainTimeout, "drain-timeout", cfg.DrainTimeout, "maximum graceful-drain duration")
+	stateSyncAddr := flag.String("state-sync", "", "trusted GSSS gRPC address; empty disables State Sync transport")
+	stateSyncUser := flag.String("state-sync-user", "", "demo user routed to GSSS")
+	stateSyncMatch := flag.String("state-sync-match", "", "demo MatchID used for the configured State Sync user")
+	stateSyncRoutes := flag.String("state-sync-routes", "", "demo routes: user=match,user=match (overrides single-user flags)")
 	gatewayID := flag.String("gateway-id", "gateway-1", "gateway instance id")
 	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	var opts []gateway.Option
 	var redisClient *redis.Client
+	var stateSyncConn *grpc.ClientConn
 	if cfg.PresenceRedisAddr != "" {
 		redisClient = redis.NewClient(&redis.Options{Addr: cfg.PresenceRedisAddr})
 		defer redisClient.Close()
 		opts = append(opts, gateway.WithPresenceRegistry(presence.NewRedisRegistry(redisClient, cfg.PresenceKeyPrefix, cfg.PresenceLeaseTTL)))
+	}
+	if *stateSyncAddr != "" {
+		var err error
+		stateSyncConn, err = grpc.NewClient(*stateSyncAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			logger.Error("create State Sync client", "error", err)
+			os.Exit(1)
+		}
+		defer stateSyncConn.Close()
+		client, err := statesync.New(context.Background(), stateSyncConn, statesync.Handler{})
+		if err != nil {
+			logger.Error("connect State Sync", "error", err)
+			os.Exit(1)
+		}
+		opts = append(opts, gateway.WithStateSyncClient(client))
+		if *stateSyncRoutes != "" || (*stateSyncUser != "" && *stateSyncMatch != "") {
+			router := routing.NewStaticRouter()
+			router.SetMessageBackend(statesync.MessageTypeInput, "state-sync")
+			routes := map[string]string{}
+			if *stateSyncRoutes != "" {
+				for _, item := range strings.Split(*stateSyncRoutes, ",") {
+					parts := strings.SplitN(strings.TrimSpace(item), "=", 2)
+					if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+						routes[parts[0]] = parts[1]
+					}
+				}
+			} else {
+				routes[*stateSyncUser] = *stateSyncMatch
+			}
+			for user, matchID := range routes {
+				router.SetUserRoom(user, matchID)
+				router.SetRoomInstance(matchID, routing.BackendInstance{ID: "state-sync", BackendType: "state-sync", Address: *stateSyncAddr})
+			}
+			opts = append(opts, gateway.WithRouter(router))
+		}
 	}
 	gw := gateway.New(cfg, *gatewayID, logger, opts...)
 	hs := &http.Server{Addr: cfg.ListenAddr, Handler: gw.Handler(), ReadHeaderTimeout: 5 * time.Second}

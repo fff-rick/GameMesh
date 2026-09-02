@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
+	_ "embed"
 	"encoding/hex"
 	"errors"
 	"game-gateway/internal/auth"
@@ -14,15 +15,22 @@ import (
 	"game-gateway/internal/reliability"
 	"game-gateway/internal/routing"
 	"game-gateway/internal/session"
+	"game-gateway/internal/statesync"
 	"game-gateway/internal/ws"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	state_syncv1 "github.com/xin/gsss/api/state_sync/v1"
 	"golang.org/x/time/rate"
+	"google.golang.org/protobuf/proto"
 )
+
+//go:embed demo.html
+var demoHTML []byte
 
 type Option func(*Server)
 
@@ -64,6 +72,9 @@ func WithPresenceRegistry(r presence.Registry) Option {
 	return func(s *Server) { s.presence = r }
 }
 
+// WithStateSyncClient attaches the optional trusted GSSS stream adapter.
+func WithStateSyncClient(c *statesync.Client) Option { return func(s *Server) { s.stateSync = c } }
+
 type Server struct {
 	cfg         config.Config
 	gatewayID   string
@@ -97,6 +108,14 @@ type Server struct {
 	leases                map[string]presence.Owner // conn ID -> current fenced lease; lifecycleMu protected
 	inboundLimiter        *rate.Limiter
 	backendSlots          chan struct{}
+	stateSync             *statesync.Client
+	stateSyncBindings     map[string]stateSyncBinding // session ID -> Match/Player; lifecycleMu protected
+	stateSyncInputSeq     map[stateSyncBinding]uint64 // Match/Player -> Gateway-owned contiguous sequence; lifecycleMu protected
+}
+
+type stateSyncBinding struct {
+	matchID  string
+	playerID uint64
 }
 
 func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Option) *Server {
@@ -135,14 +154,19 @@ func New(cfg config.Config, gatewayID string, logger *slog.Logger, opts ...Optio
 		reliability: reliability.NewManager(reliability.Config{
 			PendingLimit: cfg.ReliablePendingLimit, DedupWindow: cfg.ReliableDedupWindow, RetryInterval: cfg.ReliableRetryInterval, MaxRetries: cfg.ReliableMaxRetries,
 		}),
-		reliableStop:   make(chan struct{}),
-		presenceStop:   make(chan struct{}),
-		leases:         make(map[string]presence.Owner),
-		inboundLimiter: rate.NewLimiter(rate.Limit(cfg.GlobalRate), cfg.GlobalRateBurst),
-		backendSlots:   make(chan struct{}, cfg.BackendMaxInFlight),
+		reliableStop:      make(chan struct{}),
+		presenceStop:      make(chan struct{}),
+		leases:            make(map[string]presence.Owner),
+		inboundLimiter:    rate.NewLimiter(rate.Limit(cfg.GlobalRate), cfg.GlobalRateBurst),
+		backendSlots:      make(chan struct{}, cfg.BackendMaxInFlight),
+		stateSyncBindings: make(map[string]stateSyncBinding),
+		stateSyncInputSeq: make(map[stateSyncBinding]uint64),
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.stateSync != nil {
+		s.stateSync.SetHandler(statesync.Handler{Snapshot: s.handleStateSyncSnapshot, Control: s.handleStateSyncControl})
 	}
 	if s.cfg.HeartbeatCheckInterval > 0 && s.cfg.IdleTimeout > 0 {
 		s.heartbeatWG.Add(1)
@@ -173,6 +197,10 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("/demo/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(demoHTML)
+	})
 	return mux
 }
 
@@ -188,6 +216,9 @@ func (s *Server) ReliablePendingCount() int               { return s.reliability
 func (s *Server) Close() {
 	if !s.closing.CompareAndSwap(false, true) {
 		return
+	}
+	if s.stateSync != nil {
+		s.stateSync.Close()
 	}
 	close(s.heartbeatStop)
 	s.heartbeatWG.Wait()
@@ -301,6 +332,7 @@ func (s *Server) removeConn(c *Connection) {
 
 	if s.closing.Load() {
 		if ended := s.sessions.TerminateByConn(c.ID()); ended != nil {
+			s.removeStateSyncBindingLocked(ended.ID, state_syncv1.LeaveReason_LEAVE_REASON_DISCONNECTED)
 			s.reliability.RemoveSession(ended.ID)
 			s.metrics.SetReliablePending(s.reliability.PendingCount())
 			s.updateSessionMetricsLocked()
@@ -345,6 +377,14 @@ func (s *Server) handleEnvelope(c *Connection, env protocol.Envelope) {
 	if env.MessageType >= protocol.BusinessMessageMin && !c.Authenticated() {
 		s.unauthRejects.Add(1)
 		c.logger.Warn("unauthenticated business message rejected", "message_type", env.MessageType, "request_id", env.RequestID)
+		return
+	}
+	if c.Authenticated() && env.MessageType == statesync.MessageTypeInput {
+		s.handleStateSyncInput(c, env)
+		return
+	}
+	if c.Authenticated() && env.MessageType == statesync.MessageTypeSnapshotAck {
+		s.handleStateSyncAck(c, env)
 		return
 	}
 	if env.MessageType >= protocol.BusinessMessageMin {
@@ -487,6 +527,10 @@ func (s *Server) handleAuth(c *Connection, env protocol.Envelope) {
 		s.metrics.Presence("claim_success")
 	}
 	if replaced != nil {
+		// A replacement is another connection for the same authenticated user.
+		// Preserve its GSSS player and input sequence so a page reload cannot
+		// cause a late Leave or reset a contiguous-input stream.
+		s.detachStateSyncBindingLocked(replaced.ID)
 		s.reliability.RemoveSession(replaced.ID)
 		s.metrics.SetReliablePending(s.reliability.PendingCount())
 		if !replaced.GraceDeadline.IsZero() {
@@ -748,11 +792,154 @@ func (s *Server) expireSessions(now time.Time) {
 	}
 	for _, ended := range expired {
 		s.reliability.RemoveSession(ended.ID)
+		s.removeStateSyncBindingLocked(ended.ID, state_syncv1.LeaveReason_LEAVE_REASON_DISCONNECTED)
 		s.metrics.GraceExpired()
 	}
 	s.graceSessions.Add(-int64(len(expired)))
 	s.metrics.SetReliablePending(s.reliability.PendingCount())
 	s.updateSessionMetricsLocked()
+}
+
+func (s *Server) handleStateSyncInput(c *Connection, env protocol.Envelope) {
+	if s.stateSync == nil {
+		s.sendError(c, env.RequestID, "state_sync_unavailable", true)
+		return
+	}
+	route, err := s.router.Resolve(c.UserID(), env.MessageType)
+	if err != nil {
+		s.sendRoutingError(c, env.RequestID, err)
+		return
+	}
+	var input state_syncv1.PlayerInput
+	if err := proto.Unmarshal(env.Payload, &input); err != nil {
+		s.sendError(c, env.RequestID, "state_sync_invalid_input", false)
+		return
+	}
+	playerID := stateSyncPlayerID(c.UserID())
+	s.lifecycleMu.Lock()
+	binding, exists := s.stateSyncBindings[c.SessionID()]
+	if exists && (binding.matchID != route.RoomID || binding.playerID != playerID) {
+		s.removeStateSyncBindingLocked(c.SessionID(), state_syncv1.LeaveReason_LEAVE_REASON_REQUESTED)
+		exists = false
+	}
+	if !exists {
+		if err := s.stateSync.SendJoin(route.RoomID, playerID); err != nil {
+			s.lifecycleMu.Unlock()
+			s.sendError(c, env.RequestID, "state_sync_unavailable", true)
+			return
+		}
+		binding = stateSyncBinding{matchID: route.RoomID, playerID: playerID}
+		s.stateSyncBindings[c.SessionID()] = binding
+	}
+	s.stateSyncInputSeq[binding]++
+	inputSeq := s.stateSyncInputSeq[binding]
+	s.lifecycleMu.Unlock()
+	// Gateway, never the client, owns identity, routing and input ordering. The
+	// latter makes a browser reload safe for GSSS's contiguous-input contract.
+	input.MatchId, input.PlayerId, input.InputSeq = route.RoomID, playerID, inputSeq
+	if err := s.stateSync.SendInput(&input); err != nil {
+		s.sendError(c, env.RequestID, "state_sync_unavailable", true)
+	}
+}
+
+func (s *Server) handleStateSyncAck(c *Connection, env protocol.Envelope) {
+	if s.stateSync == nil {
+		s.sendError(c, env.RequestID, "state_sync_unavailable", true)
+		return
+	}
+	var ack state_syncv1.SnapshotAck
+	if err := proto.Unmarshal(env.Payload, &ack); err != nil {
+		s.sendError(c, env.RequestID, "state_sync_invalid_ack", false)
+		return
+	}
+	s.lifecycleMu.Lock()
+	binding, ok := s.stateSyncBindings[c.SessionID()]
+	s.lifecycleMu.Unlock()
+	if !ok {
+		s.sendError(c, env.RequestID, "state_sync_not_joined", true)
+		return
+	}
+	ack.MatchId, ack.PlayerId = binding.matchID, binding.playerID
+	if err := s.stateSync.SendAck(&ack); err != nil {
+		s.sendError(c, env.RequestID, "state_sync_unavailable", true)
+	}
+}
+
+func (s *Server) handleStateSyncSnapshot(snapshot *state_syncv1.Snapshot) {
+	s.lifecycleMu.Lock()
+	var sessionID string
+	for id, binding := range s.stateSyncBindings {
+		if binding.matchID == snapshot.MatchId && binding.playerID == snapshot.RecipientPlayerId {
+			sessionID = id
+			break
+		}
+	}
+	s.lifecycleMu.Unlock()
+	if sessionID == "" {
+		return
+	}
+	current, ok := s.sessions.ByID(sessionID)
+	if !ok {
+		return
+	}
+	if c := s.connectionByID(current.ConnID); c != nil {
+		payload, err := proto.Marshal(snapshot)
+		if err == nil {
+			s.sendEnvelope(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: statesync.MessageTypeSnapshot, Payload: payload, TimestampUnixMS: time.Now().UnixMilli()})
+		}
+	}
+}
+func (s *Server) handleStateSyncControl(control *state_syncv1.ControlEvent) {
+	s.lifecycleMu.Lock()
+	var sessionID string
+	for id, binding := range s.stateSyncBindings {
+		if binding.matchID == control.MatchId && binding.playerID == control.PlayerId {
+			sessionID = id
+			break
+		}
+	}
+	s.lifecycleMu.Unlock()
+	if sessionID == "" {
+		return
+	}
+	current, ok := s.sessions.ByID(sessionID)
+	if !ok {
+		return
+	}
+	if c := s.connectionByID(current.ConnID); c != nil {
+		if payload, err := proto.Marshal(control); err == nil {
+			s.sendEnvelope(c, protocol.Envelope{Version: protocol.CurrentVersion, MessageType: statesync.MessageTypeControl, Payload: payload, TimestampUnixMS: time.Now().UnixMilli()})
+		}
+	}
+}
+func (s *Server) removeStateSyncBindingLocked(sessionID string, reason state_syncv1.LeaveReason) {
+	binding, ok := s.stateSyncBindings[sessionID]
+	if !ok {
+		return
+	}
+	delete(s.stateSyncBindings, sessionID)
+	delete(s.stateSyncInputSeq, binding)
+	if s.stateSync != nil {
+		// Preserve stream ordering: a later Join must never be overtaken by this
+		// Leave on the shared GSSS stream.
+		_ = s.stateSync.SendLeave(binding.matchID, binding.playerID, reason)
+	}
+}
+
+// detachStateSyncBindingLocked only removes the local session association. It
+// intentionally keeps the GSSS player and its sequence during same-user
+// replacement, so reconnecting a browser does not restart authoritative state.
+func (s *Server) detachStateSyncBindingLocked(sessionID string) {
+	delete(s.stateSyncBindings, sessionID)
+}
+func stateSyncPlayerID(userID string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(userID))
+	id := h.Sum64()
+	if id == 0 {
+		return 1
+	}
+	return id
 }
 
 func (s *Server) updateSessionMetricsLocked() {
